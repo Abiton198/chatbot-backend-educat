@@ -1,8 +1,7 @@
-fastapi
-uvicorn
-sentence-transformers
-faiss-cpu
+flask
+flask-cors
+groq
+huggingface-hub
 numpy
 pdfplumber
-groq
 python-dotenv
