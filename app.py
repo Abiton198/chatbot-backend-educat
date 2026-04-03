@@ -1,22 +1,18 @@
-# app.py
 from dotenv import load_dotenv
-load_dotenv()  # Must be first before any other imports
+load_dotenv()
 
 import os
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 from model import generate_answer
 from rag import RAGIndex
 import traceback
 
-app = FastAPI()
+app = Flask(__name__)
+CORS(app)
 rag = RAGIndex()
 
-class ChatRequest(BaseModel):
-    question: str
-
-@app.get("/", response_class=HTMLResponse)
+@app.route("/")
 def home():
     return """
     <!DOCTYPE html>
@@ -56,13 +52,19 @@ def home():
     </html>
     """
 
-@app.post("/chat")
-def chat(request: ChatRequest):
+@app.route("/chat", methods=["POST"])
+def chat():
     try:
-        chunks = rag.search(request.question)  # Fixed: was search(), now rag.search()
+        data = request.get_json()
+        question = data.get("question", "")
+        chunks = rag.search(question)
         context = " ".join(chunks)
-        answer = generate_answer(context, request.question)
-        return {"question": request.question, "answer": answer}
+        answer = generate_answer(context, question)
+        return jsonify({"question": question, "answer": answer})
     except Exception as e:
         traceback.print_exc()
-        return {"question": request.question, "answer": f"Error: {str(e)}"}
+        return jsonify({"question": "", "answer": f"Error: {str(e)}"})
+
+
+if __name__ == "__main__":
+    app.run(debug=True, port=8000)
