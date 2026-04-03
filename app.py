@@ -9,7 +9,14 @@ from rag import RAGIndex
 import traceback
 
 app = Flask(__name__)
-CORS(app)
+
+# ✅ Allow your frontend domain(s)
+CORS(app, resources={r"/chat": {"origins": [
+    "http://localhost:3000",        # local dev
+    "http://localhost:5176",        # Vite dev server
+    "https://edu-cat.netlify.app/", # ← replace with your actual Netlify URL
+]}})
+
 rag = RAGIndex()
 
 @app.route("/")
