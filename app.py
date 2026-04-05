@@ -148,10 +148,12 @@ async function loadExams() {
     const res = await fetch("/exams");
     const data = await res.json();
 
+    console.log("API response:", data); // 👈 DEBUG
+
     const select = document.getElementById("examSelect");
     select.innerHTML = "";
 
-    data.exams.forEach(e => {
+    (data.exams || []).forEach(e => {
         const opt = document.createElement("option");
         opt.value = e;
         opt.text = e;
@@ -344,14 +346,18 @@ async function submitExam() {
 @app.route("/exams", methods=["GET"])
 def list_exams():
     try:
+        print("EXAMS_FOLDER:", EXAMS_FOLDER)  # 👈 DEBUG
+
         exams = [
             f for f in os.listdir(EXAMS_FOLDER)
             if f.endswith("_exam.json")
         ]
-        return jsonify({"exams": exams})
-    except Exception as e:
-        return jsonify({"error": str(e)})
 
+        return jsonify({"exams": exams})
+
+    except Exception as e:
+        print("ERROR:", str(e))  # 👈 DEBUG
+        return jsonify({"error": str(e)})
 
 # =========================
 # ▶️ START EXAM SESSION
