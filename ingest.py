@@ -8,110 +8,127 @@ import os
 import json
 
 
-# 🚀 Debug: confirms script is running
 print("🔥 SCRIPT STARTED")
-
-# 📁 Shows where Python is currently running from
-# (IMPORTANT for fixing folder path issues)
 print("📁 Current directory:", os.getcwd())
 
 
-# 🧾 FUNCTION: Extract text from a PDF file
+# =========================
+# 🧾 EXTRACT TEXT FROM PDF
+# =========================
 def extract_text_from_pdf(pdf_path):
     text = ""
 
-    # Open the PDF file
     with pdfplumber.open(pdf_path) as pdf:
-
-        # Loop through each page in the PDF
         for page in pdf.pages:
-
-            # Extract text from the page
             page_text = page.extract_text()
 
-            # ⚠️ Some pages may return None → avoid errors
             if page_text:
                 text += page_text + "\n"
 
     return text
 
 
-# ✂️ FUNCTION: Break long text into smaller chunks
-# This is VERY IMPORTANT for AI retrieval later
+# =========================
+# ✂️ CHUNK TEXT
+# =========================
 def chunk_text(text, chunk_size=300):
-
-    # Split text into words
     words = text.split()
-
     chunks = []
 
-    # Loop through words in steps of chunk_size
     for i in range(0, len(words), chunk_size):
-
-        # Join words back into a chunk
         chunk = " ".join(words[i:i+chunk_size])
-
         chunks.append(chunk)
 
     return chunks
 
 
-# 📂 Folder where your PDFs are stored
+# =========================
+# 📂 PATHS
+# =========================
 data_folder = "data/"
+processed_folder = "processed/"
+tracker_file = os.path.join(processed_folder, "processed_files.json")
 
-# 🧠 This will store ALL chunks from ALL PDFs
-all_chunks = []
+# Ensure processed folder exists
+os.makedirs(processed_folder, exist_ok=True)
 
 
-print("🚀 Starting ingestion...")
+# =========================
+# 🧠 LOAD TRACKER
+# =========================
+if os.path.exists(tracker_file):
+    with open(tracker_file, "r") as f:
+        processed_files = json.load(f)
+else:
+    processed_files = []
+
+print("📌 Already processed files:", processed_files)
 
 
-# ❌ Check if data folder exists
+# =========================
+# 🚀 PROCESS FILES
+# =========================
+new_files_processed = 0
+
 if not os.path.exists(data_folder):
     print("❌ data folder NOT found!")
 
 else:
-    # 📄 Loop through all files in the data folder
     for file in os.listdir(data_folder):
 
-        print("📄 Found file:", file)
+        if not file.endswith(".pdf"):
+            continue
 
-        # ✅ Only process PDF files
-        if file.endswith(".pdf"):
+        print("\n📄 Found:", file)
 
-            print("✅ Processing:", file)
+        # ⛔ SKIP if already processed
+        if file in processed_files:
+            print("⏭️ Skipping (already processed)")
+            continue
 
-            # 📥 Step 1: Extract text from PDF
-            text = extract_text_from_pdf(os.path.join(data_folder, file))
+        print("✅ Processing NEW file:", file)
 
-            print("📝 Extracted length:", len(text))
+        pdf_path = os.path.join(data_folder, file)
 
-            # ✂️ Step 2: Break text into chunks
-            chunks = chunk_text(text)
+        # 📥 Extract text
+        text = extract_text_from_pdf(pdf_path)
+        print("📝 Extracted length:", len(text))
 
-            print("🔹 Number of chunks:", len(chunks))
+        # ✂️ Chunk text
+        chunks = chunk_text(text)
+        print("🔹 Number of chunks:", len(chunks))
 
-            # 📦 Step 3: Store chunks in dataset format
-            for chunk in chunks:
-                all_chunks.append({
-                    "source": file,   # which book it came from
-                    "content": chunk # actual text content
-                })
+        # 📦 Prepare dataset
+        file_chunks = []
+        for chunk in chunks:
+            file_chunks.append({
+                "source": file,
+                "content": chunk
+            })
+
+        # 💾 Save per-file JSON
+        output_file = os.path.join(processed_folder, file.replace(".pdf", ".json"))
+
+        with open(output_file, "w") as f:
+            json.dump(file_chunks, f, indent=2)
+
+        print("💾 Saved:", output_file)
+
+        # ✅ Mark as processed
+        processed_files.append(file)
+        new_files_processed += 1
 
 
-# 📊 Show total chunks collected
-print("📦 Total chunks:", len(all_chunks))
+# =========================
+# 💾 SAVE TRACKER
+# =========================
+with open(tracker_file, "w") as f:
+    json.dump(processed_files, f, indent=2)
 
 
-# 💾 STEP 4: Save dataset to JSON file
-
-# Create "processed" folder if it doesn’t exist
-os.makedirs("processed", exist_ok=True)
-
-# Save all chunks into a JSON file
-with open("processed/data.json", "w") as f:
-    json.dump(all_chunks, f, indent=2)
-
-
-# ✅ Final confirmation
-print("✅ Dataset created and saved!")
+# =========================
+# ✅ FINAL OUTPUT
+# =========================
+print("\n📊 New files processed:", new_files_processed)
+print("📦 Total processed files:", len(processed_files))
+print("✅ DONE")
