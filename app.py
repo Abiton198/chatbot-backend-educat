@@ -8,31 +8,26 @@ import re
 import traceback
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from model import generate_answer, mark_exam_batch, generate_exam_feedback
+from model import generate_answer, mark_answer, generate_exam_feedback
 from rag import RAGIndex
+import memory as mem
+from agent import run_agent
 
 app = Flask(__name__)
 
-# =========================
-# 🌐 CORS CONFIG
-# =========================
 CORS(app, resources={r"/*": {"origins": [
     "http://localhost:3000",
     "http://localhost:5176",
     "https://edu-cat.netlify.app"
 ]}})
 
-# =========================
-# 🧠 INIT SYSTEMS
-# =========================
-rag = RAGIndex()
-
+rag          = RAGIndex()
 EXAMS_FOLDER = "exams"
-sessions = {}  # ⚠️ In-memory — replace with DB for production
+sessions     = {}   # in-memory exam sessions (separate from agent memory)
 
 
 # =========================
-# 📁 LOAD EXAM FILE
+# 📁 HELPERS
 # =========================
 def load_exam(exam_name):
     path = os.path.join(EXAMS_FOLDER, exam_name)
@@ -42,21 +37,13 @@ def load_exam(exam_name):
         return json.load(f)
 
 
-# =========================
-# 🔥 FLATTEN EXAM → QUESTION LIST
-# =========================
 def flatten_exam(exam):
     flat     = []
     sections = exam.get("sections", [])
-
     if not sections and "questions" in exam:
-        sections = [{
-            "section":              "A",
-            "section_title":        None,
-            "section_instructions": None,
-            "total_marks":          None,
-            "questions":            exam["questions"]
-        }]
+        sections = [{"section":"A","section_title":None,
+                     "section_instructions":None,"total_marks":None,
+                     "questions":exam["questions"]}]
 
     for section in sections:
         sec_label        = section.get("section", "")
@@ -73,8 +60,7 @@ def flatten_exam(exam):
             question_number = q.get("question_number", f"Q{q_id}" if q_id else "")
             parent_question = q.get("parent_question", "")
             parent_context  = q.get("parent_context")
-
-            options  = None
+            options         = None
             column_a = column_b = None
 
             if q_type == "mcq":
@@ -83,446 +69,474 @@ def flatten_exam(exam):
                     options = [{"key": k, "value": v} for k, v in sorted(raw_opts.items()) if str(v).strip()]
                 elif isinstance(raw_opts, list):
                     options = [{"key": chr(65+i), "value": str(v).strip()} for i, v in enumerate(raw_opts) if str(v).strip()]
-                if not options:
-                    q_text, options = extract_mcq_from_text(q_text)
 
             if q_type == "matching":
                 column_a = q.get("column_a", [])
                 column_b = q.get("column_b", [])
 
             flat.append({
-                "id":                   q_id,
-                "question_number":      question_number,
-                "parent_question":      parent_question,
-                "parent_context":       parent_context,
-                "section":              sec_label,
-                "section_title":        sec_title,
-                "section_instructions": sec_instructions,
-                "section_total_marks":  sec_marks,
-                "question":             q_text or "⚠️ Question text missing",
-                "type":                 q_type,
-                "options":              options,
-                "column_a":             column_a,
-                "column_b":             column_b,
-                "marks":                marks,
-                "memo":                 memo,
-                "saved_answer":         ""
+                "id": q_id, "question_number": question_number,
+                "parent_question": parent_question, "parent_context": parent_context,
+                "section": sec_label, "section_title": sec_title,
+                "section_instructions": sec_instructions, "section_total_marks": sec_marks,
+                "question": q_text or "⚠️ Question text missing",
+                "type": q_type, "options": options,
+                "column_a": column_a, "column_b": column_b,
+                "marks": marks, "memo": memo, "saved_answer": ""
             })
-
     return flat
 
 
-def extract_mcq_from_text(question_text):
-    pattern = r"(?:A[\.\)]\s*(.*?)\s*)(?:B[\.\)]\s*(.*?)\s*)(?:C[\.\)]\s*(.*?)\s*)(?:D[\.\)]\s*(.*))"
-    match   = re.search(pattern, question_text, re.IGNORECASE | re.DOTALL)
-    if match:
-        keys    = ["A", "B", "C", "D"]
-        options = [{"key": keys[i], "value": opt.strip()} for i, opt in enumerate(match.groups()) if opt and opt.strip()]
-        clean   = re.split(r"A[\.\)]", question_text, flags=re.IGNORECASE)[0].strip()
-        return clean, options if options else None
-    return question_text, None
-
-
 # =========================
-# 🏠 HOME — TEST UI
+# 🏠 HOME UI
 # =========================
 @app.route("/")
 def home():
-    return r"""
-<!DOCTYPE html>
+    return r"""<!DOCTYPE html>
 <html>
 <head>
-    <title>EduCAT — AI Learning System</title>
-    <style>
-        * { box-sizing: border-box; }
-        body { font-family: Arial, sans-serif; max-width: 960px; margin: auto; padding: 20px; background: #f9f9f9; }
-        h1 { text-align: center; color: #2c3e50; }
-        button { padding: 10px 18px; margin: 5px; cursor: pointer; border: none; border-radius: 6px; background: #3498db; color: white; font-size: 14px; }
-        button:hover { opacity: 0.88; }
-        button:disabled { background: #bdc3c7; cursor: not-allowed; }
-        textarea { width: 100%; height: 130px; margin-top: 10px; padding: 10px; border-radius: 6px; border: 1px solid #ddd; font-size: 14px; resize: vertical; }
-        .box { border: 1px solid #ddd; padding: 18px; border-radius: 10px; margin-top: 20px; background: white; }
-        .hidden { display: none; }
-        select, input[type=text] { padding: 10px; width: 100%; margin-top: 10px; border-radius: 6px; border: 1px solid #ccc; font-size: 14px; }
-        .sec-header { background: #eaf0fb; padding: 10px 14px; border-radius: 8px; margin-bottom: 12px; border-left: 4px solid #3498db; }
-        .sec-header .sec-label { font-weight: bold; font-size: 15px; color: #2c3e50; }
-        .sec-header .sec-sub   { font-size: 13px; color: #555; margin-top: 3px; }
-        .parent-heading { font-size: 13px; font-weight: bold; color: #7f8c8d; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px; }
-        .parent-context { background: #fefae0; border-left: 3px solid #f1c40f; padding: 8px 12px; border-radius: 5px; font-size: 13px; color: #555; margin-bottom: 10px; }
-        .q-row { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
-        .q-row .q-num  { font-weight: bold; white-space: nowrap; color: #2c3e50; min-width: 40px; }
-        .q-row .q-text { flex: 1; font-size: 15px; line-height: 1.5; }
-        .q-row .q-mark { white-space: nowrap; font-weight: bold; color: #e74c3c; }
-        .option-label { display: block; margin: 8px 0; padding: 9px 14px; border: 1px solid #ddd; border-radius: 6px; cursor: pointer; }
-        .option-label:hover { background: #f0f4ff; }
-        .option-label input { margin-right: 8px; }
-        .tf-label { display: inline-block; margin-right: 20px; padding: 9px 18px; border: 1px solid #ddd; border-radius: 6px; cursor: pointer; }
-        .tf-label:hover { background: #f0f4ff; }
-        .match-table { width: 100%; border-collapse: collapse; margin-top: 10px; }
-        .match-table th { text-align: left; padding: 8px 10px; border-bottom: 2px solid #ddd; background: #f5f5f5; }
-        .match-table td { padding: 8px 10px; border-bottom: 1px solid #eee; vertical-align: middle; }
-        .match-table select { width: 100%; padding: 6px; border-radius: 4px; border: 1px solid #ccc; }
-        .nav-bar { margin-top: 18px; display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
-        .nav-bar .submit-btn { margin-left: auto; background: #e74c3c; }
-        .progress { margin-top: 10px; color: #888; font-size: 13px; }
-        .result-card { border: 1px solid #ccc; margin: 10px 0; padding: 12px 16px; border-radius: 8px; font-size: 14px; line-height: 1.6; }
-        .feedback-box { background: #eafaf1; border-left: 4px solid #27ae60; padding: 14px; border-radius: 8px; margin-top: 12px; font-size: 14px; }
-    </style>
+<title>EduCAT — AI Agent</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:Arial,sans-serif;background:#f4f6f9;color:#2c3e50}
+.app{display:flex;height:100vh}
+.sidebar{width:240px;background:#2c3e50;color:#ecf0f1;padding:20px;display:flex;flex-direction:column;gap:12px;flex-shrink:0}
+.sidebar h2{font-size:18px;font-weight:700;margin-bottom:8px}
+.sidebar .student-id{font-size:11px;opacity:.5;word-break:break-all}
+.nav-btn{padding:10px 14px;background:rgba(255,255,255,.08);border:none;color:#ecf0f1;border-radius:8px;cursor:pointer;text-align:left;font-size:13px}
+.nav-btn:hover,.nav-btn.active{background:rgba(255,255,255,.18)}
+.sep{height:1px;background:rgba(255,255,255,.1);margin:4px 0}
+.main{flex:1;display:flex;flex-direction:column;overflow:hidden}
+.panel{flex:1;display:none;flex-direction:column;overflow:hidden}
+.panel.active{display:flex}
+
+/* Chat panel */
+.chat-messages{flex:1;overflow-y:auto;padding:20px;display:flex;flex-direction:column;gap:12px}
+.msg{max-width:72%;padding:12px 16px;border-radius:12px;font-size:14px;line-height:1.6}
+.msg.user{background:#3498db;color:#fff;align-self:flex-end;border-bottom-right-radius:4px}
+.msg.agent{background:#fff;border:1px solid #e0e0e0;align-self:flex-start;border-bottom-left-radius:4px}
+.msg.agent.thinking{opacity:.6;font-style:italic}
+.chat-input-row{padding:16px 20px;background:#fff;border-top:1px solid #e0e0e0;display:flex;gap:10px}
+.chat-input-row input{flex:1;padding:10px 14px;border:1px solid #ddd;border-radius:8px;font-size:14px}
+.chat-input-row button{padding:10px 18px;background:#3498db;color:#fff;border:none;border-radius:8px;cursor:pointer;font-size:14px}
+.chat-input-row button:hover{opacity:.88}
+
+/* Exam panel */
+.exam-setup{padding:24px;background:#fff;border-bottom:1px solid #e0e0e0}
+.exam-setup h3{margin-bottom:12px}
+.exam-setup select,.exam-setup button{padding:9px 14px;border-radius:7px;border:1px solid #ddd;font-size:13px;margin-right:8px}
+.exam-setup button{background:#27ae60;color:#fff;border-color:#27ae60;cursor:pointer}
+.memo-status{margin-top:8px;font-size:12px;color:#888}
+.exam-area{flex:1;overflow-y:auto;padding:24px}
+.sec-header{background:#eaf0fb;padding:10px 14px;border-radius:8px;margin-bottom:14px;border-left:4px solid #3498db}
+.sec-header .sec-label{font-weight:bold;font-size:15px}
+.sec-header .sec-sub{font-size:12px;color:#555;margin-top:3px}
+.parent-heading{font-size:12px;font-weight:bold;color:#7f8c8d;text-transform:uppercase;margin-bottom:4px}
+.parent-context{background:#fefae0;border-left:3px solid #f1c40f;padding:8px 12px;border-radius:5px;font-size:13px;color:#555;margin-bottom:10px}
+.q-row{display:flex;gap:10px;margin-top:10px;align-items:flex-start}
+.q-num{font-weight:bold;min-width:40px;color:#2c3e50}
+.q-text{flex:1;font-size:14px;line-height:1.5}
+.q-mark{color:#e74c3c;font-weight:bold;white-space:nowrap}
+.option-label{display:block;margin:7px 0;padding:8px 13px;border:1px solid #ddd;border-radius:6px;cursor:pointer;font-size:13px}
+.option-label:hover{background:#f0f4ff}
+.option-label input{margin-right:8px}
+.tf-label{display:inline-block;margin-right:16px;padding:8px 16px;border:1px solid #ddd;border-radius:6px;cursor:pointer;font-size:13px}
+.tf-label:hover{background:#f0f4ff}
+.match-table{width:100%;border-collapse:collapse;margin-top:8px;font-size:13px}
+.match-table th{text-align:left;padding:7px 9px;border-bottom:2px solid #ddd;background:#f5f5f5}
+.match-table td{padding:7px 9px;border-bottom:1px solid #eee;vertical-align:middle}
+.match-table select{width:100%;padding:5px;border-radius:4px;border:1px solid #ccc}
+textarea{width:100%;height:110px;margin-top:12px;padding:10px;border:1px solid #ddd;border-radius:7px;font-size:13px;resize:vertical}
+.nav-bar{margin-top:16px;display:flex;gap:8px;flex-wrap:wrap}
+.nav-bar button{padding:9px 16px;border:none;border-radius:7px;cursor:pointer;font-size:13px;background:#3498db;color:#fff}
+.nav-bar .submit-btn{margin-left:auto;background:#e74c3c}
+.progress{margin-top:8px;color:#888;font-size:12px}
+
+/* Results panel */
+.results-area{flex:1;overflow-y:auto;padding:24px}
+.score-banner{background:#fff;border:1px solid #e0e0e0;border-radius:10px;padding:20px;margin-bottom:16px;text-align:center}
+.score-banner h2{font-size:28px;margin-bottom:6px}
+.feedback-box{background:#eafaf1;border-left:4px solid #27ae60;padding:14px;border-radius:8px;margin-bottom:16px;font-size:13px;line-height:1.6}
+.result-card{border:1px solid #ddd;border-radius:8px;padding:14px;margin-bottom:10px;font-size:13px;line-height:1.7}
+
+/* Dashboard panel */
+.dashboard{flex:1;overflow-y:auto;padding:24px;display:flex;flex-direction:column;gap:16px}
+.dash-card{background:#fff;border:1px solid #e0e0e0;border-radius:10px;padding:18px}
+.dash-card h3{font-size:15px;margin-bottom:10px;font-weight:600}
+.weak-item{display:flex;align-items:center;gap:10px;padding:7px 0;border-bottom:1px solid #f0f0f0;font-size:13px}
+.weak-bar-bg{flex:1;height:6px;background:#f0f0f0;border-radius:3px}
+.weak-bar{height:6px;background:#e74c3c;border-radius:3px}
+.session-row{display:flex;justify-content:space-between;font-size:13px;padding:6px 0;border-bottom:1px solid #f0f0f0}
+.plan-text{font-size:13px;line-height:1.7;white-space:pre-wrap;color:#555}
+.hint-btn{padding:5px 10px;background:#f39c12;color:#fff;border:none;border-radius:5px;cursor:pointer;font-size:12px}
+</style>
 </head>
 <body>
+<div class="app">
+  <div class="sidebar">
+    <h2>🎓 EduCAT</h2>
+    <div class="student-id" id="sidDisplay"></div>
+    <div class="sep"></div>
+    <button class="nav-btn" onclick="showPanel('tutor', event)">💬 AI Tutor</button>
+    <button class="nav-btn" onclick="showPanel('exam', event)">📝 Exam Mocker</button>
+ 
+    <button class="nav-btn" onclick="showPanel('dashboard'); loadDashboard()">📊 My Dashboard</button>
+    <div class="sep"></div>
+    <button class="nav-btn" onclick="clearHistory()">🗑 Clear chat</button>
+  </div>
 
-<h1>🎓 EduCAT — AI Learning System</h1>
+  <div class="main">
 
-<div class="box">
-    <h3>Select Mode</h3>
-    <button onclick="setMode('tutor')">🎓 AI Tutor</button>
-    <button onclick="setMode('exam')">📝 Exam Mocker</button>
+    <!-- CHAT PANEL -->
+    <div class="panel active" id="panel-chat">
+      <div class="chat-messages" id="chatMessages"></div>
+      <div class="chat-input-row">
+        <input id="chatInput" placeholder="Ask anything about CAT, or say 'what should I study?'" onkeydown="if(event.key==='Enter')sendChat()">
+        <button onclick="sendChat()">Send</button>
+      </div>
+    </div>
+
+    <!-- EXAM PANEL -->
+    <div class="panel" id="panel-exam">
+      <div class="exam-setup">
+        <h3>📝 Exam Mocker</h3>
+        <select id="examSelect"></select>
+        <button onclick="startExam()">▶ Start</button>
+        <div class="memo-status" id="memoStatus"></div>
+      </div>
+      <div class="exam-area" id="examArea"></div>
+    </div>
+
+    <!-- RESULTS PANEL -->
+    <div class="panel" id="panel-results">
+      <div class="results-area" id="resultsArea"></div>
+    </div>
+
+    <!-- DASHBOARD PANEL -->
+    <div class="panel" id="panel-dashboard">
+      <div class="dashboard" id="dashboardArea">
+        <p style="color:#888;font-size:13px">Loading dashboard...</p>
+      </div>
+    </div>
+
+  </div>
 </div>
-
-<div id="tutorBox" class="box hidden">
-    <h3>🎓 Ask AI Tutor</h3>
-    <input type="text" id="tutorInput" placeholder="Ask anything about CAT..." />
-    <button onclick="askTutor()" style="margin-top:10px;">Ask</button>
-    <div id="tutorOutput" style="margin-top:12px;"></div>
-</div>
-
-<div id="examBox" class="box hidden">
-    <h3>📝 Exam Setup</h3>
-    <button onclick="loadExams()">🔄 Load Exams</button>
-    <select id="examSelect"></select>
-    <div id="memoStatus" style="margin-top:8px; font-size:13px; color:#888;"></div>
-    <button onclick="startExam()" style="margin-top:10px; background:#27ae60;">▶ Start Exam</button>
-    <div id="examArea" class="hidden" style="margin-top:20px;"></div>
-</div>
-
-<div id="resultsBox" class="box hidden"></div>
 
 <script>
-// ─── State ────────────────────────────────────────────────
-let mode       = null;
-let session_id = null;
-let currentIdx = 0;   // renamed from 'index' to avoid JS reserved-word confusion
-let total      = 0;
-let currentType = null;  // track current question type for saveAnswer()
+// ── State ──────────────────────────────────────────────
+const studentId  = localStorage.getItem('educat_sid') || 'stu_' + Math.random().toString(36).slice(2,10);
+localStorage.setItem('educat_sid', studentId);
+document.getElementById('sidDisplay').textContent = 'ID: ' + studentId;
 
-// ─── Mode switch ──────────────────────────────────────────
-function setMode(m) {
-    mode = m;
-    document.getElementById("tutorBox").classList.add("hidden");
-    document.getElementById("examBox").classList.add("hidden");
-    if (m === "tutor") document.getElementById("tutorBox").classList.remove("hidden");
-    else               document.getElementById("examBox").classList.remove("hidden");
+let sessionId   = null;
+let currentIdx  = 0;
+let totalQ      = 0;
+let currentType = null;
+
+// ── Panel switching ────────────────────────────────────
+function showPanel(name, e) {
+  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
+
+  const panel = document.getElementById('panel-' + name);
+  if (panel) panel.classList.add('active');
+
+  if (e && e.target) {
+    e.target.classList.add('active');
+  }
 }
 
-// ─── AI Tutor ─────────────────────────────────────────────
-async function askTutor() {
-    const q = document.getElementById("tutorInput").value.trim();
-    if (!q) return;
-    const res  = await fetch("/chat", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({question:q, mode:"tutor"}) });
-    const data = await res.json();
-    document.getElementById("tutorOutput").innerHTML += `<p><b>Q:</b> ${q}<br><b>AI:</b> ${data.answer || "⚠️ No response"}</p><hr>`;
-    document.getElementById("tutorInput").value = "";
+// ── Chat / Agent ────────────────────────────────────────
+function addMsg(role, text) {
+  const box = document.getElementById('chatMessages');
+  const div = document.createElement('div');
+  div.className = 'msg ' + role;
+  div.innerHTML = text.replace(/\n/g, '<br>');
+  box.appendChild(div);
+  box.scrollTop = box.scrollHeight;
+  return div;
 }
 
-// ─── Load exam list ───────────────────────────────────────
-async function loadExams() {
-    const res  = await fetch("/exams");
-    const data = await res.json();
-    const sel  = document.getElementById("examSelect");
-    sel.innerHTML = "";
-    (data.exams || []).forEach(e => {
-        const opt = document.createElement("option");
-        opt.value = e;
-        opt.text  = e.replace("_exam.json","").replace(/_/g," ");
-        sel.appendChild(opt);
+async function sendChat() {
+  const inp = document.getElementById('chatInput');
+  const msg = inp.value.trim();
+  if (!msg) return;
+  inp.value = '';
+  addMsg('user', msg);
+  const thinking = addMsg('agent thinking', '🤔 Thinking...');
+  try {
+    const res  = await fetch('/agent-chat', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ student_id: studentId, message: msg })
     });
+    const data = await res.json();
+    thinking.remove();
+    addMsg('agent', data.response || '⚠️ No response');
+  } catch(e) {
+    thinking.remove();
+    addMsg('agent', '⚠️ Error: ' + e.message);
+  }
 }
 
-// ─── Start exam ───────────────────────────────────────────
+async function clearHistory() {
+  await fetch('/clear-history', { method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ student_id: studentId }) });
+  document.getElementById('chatMessages').innerHTML = '';
+  addMsg('agent', '🗑 Chat history cleared. How can I help you?');
+}
+
+// ── Exam ───────────────────────────────────────────────
+window.addEventListener('load', async () => {
+  const res  = await fetch('/exams');
+  const data = await res.json();
+  const sel  = document.getElementById('examSelect');
+  sel.innerHTML = '<option value="">— select exam —</option>';
+  (data.exams||[]).forEach(e => {
+    const o = document.createElement('option');
+    o.value = e; o.text = e.replace('_exam.json','').replace(/_/g,' ');
+    sel.appendChild(o);
+  });
+});
+
 async function startExam() {
-    const exam = document.getElementById("examSelect").value;
-    if (!exam) { alert("Select an exam first."); return; }
-    const res  = await fetch("/start-exam", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({exam}) });
-    const data = await res.json();
-    if (data.error) { alert("Error: " + data.error); return; }
-    session_id = data.session_id;
-    total      = data.total_questions;
-    currentIdx = 0;
-
-    const memoEl = document.getElementById("memoStatus");
-    memoEl.innerHTML = data.memo_merged
-        ? "✅ Memo loaded — AI marking enabled"
-        : "⚠️ No memo loaded — AI will give partial feedback only";
-
-    document.getElementById("examArea").classList.remove("hidden");
-    document.getElementById("resultsBox").classList.add("hidden");
-    loadQuestion();
+  const exam = document.getElementById('examSelect').value;
+  if (!exam) { alert('Select an exam first.'); return; }
+  const res  = await fetch('/start-exam', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ exam, student_id: studentId })
+  });
+  const data = await res.json();
+  if (data.error) { alert(data.error); return; }
+  sessionId  = data.session_id;
+  totalQ     = data.total_questions;
+  currentIdx = 0;
+  document.getElementById('memoStatus').innerHTML = data.memo_merged
+    ? '✅ Memo loaded' : '⚠️ No memo — AI feedback only';
+  document.getElementById('examArea').innerHTML = '';
+  showPanel('exam');
+  loadQuestion();
 }
 
-// ─── Load & render question ───────────────────────────────
 async function loadQuestion() {
-    const res = await fetch("/question", {
-        method: "POST",
-        headers: {"Content-Type":"application/json"},
-        body: JSON.stringify({ session_id, index: currentIdx })
+  const res = await fetch('/question', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ session_id: sessionId, index: currentIdx })
+  });
+  const q = await res.json();
+  if (q.error) { document.getElementById('examArea').innerHTML = '<p style="color:red">'+q.error+'</p>'; return; }
+  currentType = q.type;
+
+  let html = `<div class="sec-header">
+    <div class="sec-label">SECTION ${q.section}${q.section_title?' — '+q.section_title:''}</div>
+    ${q.section_instructions?`<div class="sec-sub">${q.section_instructions}</div>`:''}
+    ${q.section_total_marks?`<div class="sec-sub">Total: <b>${q.section_total_marks}</b> marks</div>`:''}
+  </div>`;
+
+  if (q.parent_question) html += `<div class="parent-heading">${q.parent_question}</div>`;
+  if (q.parent_context)  html += `<div class="parent-context">📌 ${q.parent_context}</div>`;
+
+  html += `<div class="q-row"><span class="q-num">${q.question_number}.</span>
+    <span class="q-text">${q.question}</span>
+    <span class="q-mark">(${q.marks})</span></div>`;
+
+  if (q.type==='mcq' && Array.isArray(q.options) && q.options.length) {
+    html += '<div id="mcqOptions" style="margin-top:12px">';
+    q.options.forEach(opt => {
+      const chk = q.saved_answer===opt.key?'checked':'';
+      html += `<label class="option-label"><input type="radio" name="mcq_answer" value="${opt.key}" ${chk}> <b>${opt.key}.</b> ${opt.value}</label>`;
     });
-    const q = await res.json();
-
-    if (q.error) {
-        document.getElementById("examArea").innerHTML = `<p style="color:red">⚠️ ${q.error}</p>`;
-        return;
-    }
-
-    // Store type so saveAnswer knows what to collect
-    currentType = q.type;
-
-    let html = "";
-
-    // Section header
-    html += `
-        <div class="sec-header">
-            <div class="sec-label">SECTION ${q.section}${q.section_title ? " — " + q.section_title : ""}</div>
-            ${q.section_instructions ? `<div class="sec-sub">${q.section_instructions}</div>` : ""}
-            ${q.section_total_marks  ? `<div class="sec-sub">Total marks for this section: <b>${q.section_total_marks}</b></div>` : ""}
-        </div>`;
-
-    if (q.parent_question) html += `<div class="parent-heading">${q.parent_question}</div>`;
-    if (q.parent_context)  html += `<div class="parent-context">📌 ${q.parent_context}</div>`;
-
-    html += `
-        <div class="q-row" style="margin-top:10px;">
-            <span class="q-num">${q.question_number}.</span>
-            <span class="q-text">${q.question}</span>
-            <span class="q-mark">(${q.marks})</span>
-        </div>`;
-
-    // ── MCQ ──────────────────────────────────────────────
-    if (q.type === "mcq" && Array.isArray(q.options) && q.options.length > 0) {
-        html += `<div id="mcqOptions" style="margin-top:14px;">`;
-        q.options.forEach(opt => {
-            const chk = q.saved_answer === opt.key ? "checked" : "";
-            html += `
-                <label class="option-label">
-                    <input type="radio" name="mcq_answer" value="${opt.key}" ${chk}>
-                    <b>${opt.key}.</b>&nbsp;${opt.value}
-                </label>`;
-        });
-        html += `</div>`;
-    }
-
-    // ── True/False ────────────────────────────────────────
-    else if (q.type === "true_false") {
-        const savedTF     = q.saved_answer || "";
-        const isFalse     = savedTF.startsWith("False");
-        const correction  = isFalse && savedTF.includes("—") ? savedTF.split("—").slice(1).join("—").trim() : "";
-        html += `
-            <div id="tfOptions" style="margin-top:14px;">
-                <label class="tf-label">
-                    <input type="radio" name="tf_answer" value="True" ${savedTF === "True" ? "checked" : ""}>
-                    ✅ True
-                </label>
-                <label class="tf-label">
-                    <input type="radio" name="tf_answer" value="False" ${isFalse ? "checked" : ""}>
-                    ❌ False
-                </label>
-            </div>
-            <div id="tfCorrection" style="margin-top:12px; ${isFalse ? "" : "display:none"}">
-                <label style="font-size:13px; color:#555;">
-                    If FALSE — write the corrected word/phrase:
-                </label>
-                <input type="text" id="tfCorrectionBox"
-                    placeholder="e.g. secondary memory"
-                    value="${correction}">
-            </div>`;
-    }
-
-    // ── Matching ──────────────────────────────────────────
-    else if (q.type === "matching" && Array.isArray(q.column_a) && q.column_a.length > 0) {
-        let saved = {};
-        try { saved = typeof q.saved_answer === "string" && q.saved_answer ? JSON.parse(q.saved_answer) : {}; } catch(e) {}
-        html += `
-            <p style="margin-top:12px; font-size:13px; color:#555;">
-                <i>Match each item in COLUMN A to the correct answer in COLUMN B.</i>
-            </p>
-            <table class="match-table" id="matchTable">
-                <thead><tr><th style="width:55%">COLUMN A</th><th>COLUMN B — Your Match</th></tr></thead>
-                <tbody>`;
-        q.column_a.forEach((item, i) => {
-            const savedVal = saved[item] || "";
-            html += `
-                <tr>
-                    <td>${item}</td>
-                    <td>
-                        <select class="match-select" data-item="${encodeURIComponent(item)}">
-                            <option value="">-- Select --</option>`;
-            q.column_b.forEach(b => {
-                html += `<option value="${b}" ${savedVal === b ? "selected" : ""}>${b}</option>`;
-            });
-            html += `       </select>
-                    </td>
-                </tr>`;
-        });
-        html += `   </tbody>
-            </table>`;
-    }
-
-    // ── Open ──────────────────────────────────────────────
-    else {
-        html += `
-            <textarea id="openAnswerBox"
-                placeholder="Write your answer here..."
-                style="margin-top:14px;">${q.saved_answer || ""}</textarea>`;
-    }
-
-    // Nav bar
-    html += `
-        <div class="nav-bar">
-            <button onclick="saveAndNext(-1)">⬅ Back</button>
-            <button onclick="saveOnly()">💾 Save</button>
-            <button onclick="saveAndNext(1)">Next ➡</button>
-            <button class="submit-btn" onclick="submitExam()">✅ Submit Exam</button>
-        </div>
-        <p class="progress">Question ${currentIdx + 1} of ${total}</p>`;
-
-    document.getElementById("examArea").innerHTML = html;
-
-    // Attach True/False toggle listener after render
-    document.querySelectorAll('input[name="tf_answer"]').forEach(r => {
-        r.addEventListener("change", () => {
-            const corrBox = document.getElementById("tfCorrection");
-            if (corrBox) {
-                corrBox.style.display = (r.value === "False" && r.checked) ? "block" : "none";
-            }
-        });
+    html += '</div>';
+  } else if (q.type==='true_false') {
+    const sf=q.saved_answer||''; const isF=sf.startsWith('False');
+    const corr=isF&&sf.includes('—')?sf.split('—').slice(1).join('—').trim():'';
+    html += `<div id="tfOptions" style="margin-top:12px">
+      <label class="tf-label"><input type="radio" name="tf_answer" value="True" ${sf==='True'?'checked':''}> ✅ True</label>
+      <label class="tf-label"><input type="radio" name="tf_answer" value="False" ${isF?'checked':''}> ❌ False</label>
+    </div>
+    <div id="tfCorrection" style="margin-top:10px;${isF?'':'display:none'}">
+      <label style="font-size:12px;color:#555">If FALSE — corrected word/phrase:</label>
+      <input type="text" id="tfCorrectionBox" placeholder="e.g. secondary memory" value="${corr}" style="width:100%;margin-top:4px;padding:8px;border:1px solid #ddd;border-radius:6px;font-size:13px">
+    </div>`;
+  } else if (q.type==='matching' && Array.isArray(q.column_a) && q.column_a.length) {
+    let saved={};
+    try { saved=typeof q.saved_answer==='string'&&q.saved_answer?JSON.parse(q.saved_answer):{}; } catch(e){}
+    html += `<p style="margin-top:10px;font-size:12px;color:#555"><i>Match each COLUMN A item to COLUMN B.</i></p>
+    <table class="match-table"><thead><tr><th style="width:55%">COLUMN A</th><th>COLUMN B</th></tr></thead><tbody>`;
+    q.column_a.forEach((item,i)=>{
+      const sv=saved[item]||'';
+      html += `<tr><td>${item}</td><td><select class="match-select" data-item="${encodeURIComponent(item)}">
+        <option value="">-- Select --</option>`;
+      q.column_b.forEach(b=>{ html+=`<option value="${b}" ${sv===b?'selected':''}>${b}</option>`; });
+      html += `</select></td></tr>`;
     });
+    html += '</tbody></table>';
+  } else {
+    html += `<textarea id="openAnswerBox" placeholder="Write your answer here...">${q.saved_answer||''}</textarea>`;
+  }
+
+  // Hint button for open questions when memo is available
+  if ((q.type==='open'||q.type==='true_false') && q.memo) {
+    html += `<div style="margin-top:8px">
+      <button class="hint-btn" onclick="askHint(${JSON.stringify(q.question).replace(/"/g,'&quot;')}, '${q.question_number}', ${JSON.stringify(String(q.memo)).replace(/"/g,'&quot;')})">
+        💡 Get a hint
+      </button></div>`;
+  }
+
+  html += `<div class="nav-bar">
+    <button onclick="saveAndGo(-1)">⬅ Back</button>
+    <button onclick="saveOnly()">💾 Save</button>
+    <button onclick="saveAndGo(1)">Next ➡</button>
+    <button class="submit-btn" onclick="submitExam()">✅ Submit</button>
+  </div>
+  <p class="progress">Question ${currentIdx+1} of ${totalQ}</p>`;
+
+  document.getElementById('examArea').innerHTML = html;
+
+  document.querySelectorAll('input[name="tf_answer"]').forEach(r=>{
+    r.addEventListener('change', ()=>{
+      const cb=document.getElementById('tfCorrection');
+      if(cb) cb.style.display=(r.value==='False'&&r.checked)?'block':'none';
+    });
+  });
 }
 
-// ─── Collect current answer (type-aware, no cross-contamination) ──
 function collectAnswer() {
-    // MCQ — only look for mcq radio buttons
-    if (currentType === "mcq") {
-        const sel = document.querySelector('input[name="mcq_answer"]:checked');
-        return sel ? sel.value : "";
+  if (currentType==='mcq') {
+    const s=document.querySelector('input[name="mcq_answer"]:checked');
+    return s?s.value:'';
+  }
+  if (currentType==='true_false') {
+    const s=document.querySelector('input[name="tf_answer"]:checked');
+    if (!s) return '';
+    if (s.value==='False') {
+      const c=(document.getElementById('tfCorrectionBox')?.value||'').trim();
+      return c?`False — ${c}`:'False';
     }
-
-    // True/False
-    if (currentType === "true_false") {
-        const sel = document.querySelector('input[name="tf_answer"]:checked');
-        if (!sel) return "";
-        if (sel.value === "False") {
-            const corr = (document.getElementById("tfCorrectionBox")?.value || "").trim();
-            return corr ? `False — ${corr}` : "False";
-        }
-        return "True";
-    }
-
-    // Matching
-    if (currentType === "matching") {
-        const obj = {};
-        document.querySelectorAll(".match-select").forEach(s => {
-            if (s.value) obj[decodeURIComponent(s.dataset.item)] = s.value;
-        });
-        return Object.keys(obj).length > 0 ? JSON.stringify(obj) : "";
-    }
-
-    // Open
-    const textBox = document.getElementById("openAnswerBox");
-    return textBox ? textBox.value.trim() : "";
+    return 'True';
+  }
+  if (currentType==='matching') {
+    const obj={};
+    document.querySelectorAll('.match-select').forEach(s=>{ if(s.value) obj[decodeURIComponent(s.dataset.item)]=s.value; });
+    return Object.keys(obj).length?JSON.stringify(obj):'';
+  }
+  return (document.getElementById('openAnswerBox')?.value||'').trim();
 }
 
-// ─── Save answer to server ────────────────────────────────
 async function saveCurrentAnswer() {
-    const answer = collectAnswer();
-    const res = await fetch("/answer", {
-        method: "POST",
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({ session_id, index: currentIdx, answer })
-    });
-    return await res.json();
+  const answer=collectAnswer();
+  await fetch('/answer',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({session_id:sessionId,index:currentIdx,answer})});
+  return answer;
 }
 
-// ─── Save only (no navigation) ────────────────────────────
 async function saveOnly() {
-    const data = await saveCurrentAnswer();
-    if (data.status === "saved") {
-        const btn = document.querySelector("button[onclick='saveOnly()']");
-        if (btn) { btn.textContent = "✅ Saved!"; setTimeout(() => btn.textContent = "💾 Save", 1500); }
-    }
+  await saveCurrentAnswer();
+  const b=document.querySelector("button[onclick='saveOnly()']");
+  if(b){b.textContent='✅ Saved!';setTimeout(()=>b.textContent='💾 Save',1500);}
 }
 
-// ─── Save then navigate ───────────────────────────────────
-async function saveAndNext(direction) {
-    await saveCurrentAnswer();
-    const next = currentIdx + direction;
-    if (next >= 0 && next < total) {
-        currentIdx = next;
-        loadQuestion();
-    }
+async function saveAndGo(dir) {
+  await saveCurrentAnswer();
+  const next=currentIdx+dir;
+  if(next>=0&&next<totalQ){currentIdx=next;loadQuestion();}
 }
 
-// ─── Submit exam ──────────────────────────────────────────
+async function askHint(qText, qNum, memo) {
+  showPanel('chat');
+  document.querySelector('.nav-btn').classList.remove('active');
+  addMsg('user', `💡 I need a hint for question ${qNum}`);
+  const thinking=addMsg('agent thinking','🤔 Generating hint...');
+  const res=await fetch('/agent-chat',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({student_id:studentId, message:`Give me a Socratic hint for question ${qNum}: "${qText}". The memo answer is: "${memo}". Do not reveal the full answer.`})});
+  const data=await res.json();
+  thinking.remove();
+  addMsg('agent', data.response||'⚠️ Could not generate hint');
+}
+
 async function submitExam() {
-    // Save current answer first
-    await saveCurrentAnswer();
+  await saveCurrentAnswer();
+  if(!confirm('Submit exam?')) return;
+  const res=await fetch('/submit',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({session_id:sessionId,student_id:studentId})});
+  const data=await res.json();
+  if(data.error){alert(data.error);return;}
 
-    if (!confirm("Submit exam? You cannot change answers after this.")) return;
+  let html=`<div class="score-banner">
+    <h2>${data.score} / ${data.total}</h2>
+    <p style="font-size:20px;font-weight:600">${data.percentage}%</p>
+  </div>`;
 
-    const res  = await fetch("/submit", {
-        method: "POST",
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({ session_id })
-    });
-    const data = await res.json();
-    if (data.error) { alert("Error: " + data.error); return; }
+  if(data.feedback) html+=`<div class="feedback-box">🤖 <b>AI Feedback:</b><br>${data.feedback}</div>`;
 
-    let html = `
-        <h3>📊 Results</h3>
-        <p><b>Score:</b> ${data.score} / ${data.total} &nbsp;|&nbsp; <b>${data.percentage}%</b></p>`;
-
-    if (data.feedback) {
-        html += `<div class="feedback-box">🤖 <b>AI Feedback:</b><br>${data.feedback}</div>`;
+  data.results.forEach(r=>{
+    const bg=r.status==='correct'?'#d4edda':r.status==='partial'?'#fff3cd':'#f8d7da';
+    const ic=r.status==='correct'?'✅':r.status==='partial'?'⚠️':'❌';
+    let sd=r.student_answer||'<i>No answer</i>';
+    if(r.type==='matching'&&r.student_answer){
+      try{const obj=JSON.parse(r.student_answer);sd=Object.entries(obj).map(([k,v])=>`${k} → ${v}`).join('<br>');}catch(e){}
     }
+    html+=`<div class="result-card" style="background:${bg}">
+      <b>${ic} ${r.question_number} [${r.marks}]:</b> ${r.question}<br>
+      <b>Your answer:</b> ${sd}<br>
+      <b>Correct:</b> ${r.correct_answer||'<i>Not available</i>'}<br>
+      <b>Feedback:</b> ${r.feedback||'—'}<br>
+      <b>Earned:</b> ${r.earned}/${r.marks}
+    </div>`;
+  });
 
-    data.results.forEach(r => {
-        const bg   = r.status === "correct" ? "#d4edda"
-                   : r.status === "partial"  ? "#fff3cd"
-                   :                           "#f8d7da";
-        const icon = r.status === "correct" ? "✅"
-                   : r.status === "partial"  ? "⚠️"
-                   :                           "❌";
+  document.getElementById('resultsArea').innerHTML=html;
+  showPanel('results');
+}
 
-        // Format correct answer for display
-        let correctDisplay = r.correct_answer || "<i>Not available</i>";
+// ── Dashboard ──────────────────────────────────────────
+async function loadDashboard() {
+  const res=await fetch('/dashboard',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({student_id:studentId})});
+  const data=await res.json();
 
-        // Format student answer for display  
-        let studentDisplay = r.student_answer || "<i>No answer</i>";
-        // If matching, pretty-print the JSON
-        if (r.type === "matching" && r.student_answer) {
-            try {
-                const obj = JSON.parse(r.student_answer);
-                studentDisplay = Object.entries(obj).map(([k,v]) => `${k} → ${v}`).join("<br>");
-            } catch(e) {}
-        }
-
-        html += `
-            <div class="result-card" style="background:${bg};">
-                <b>${icon} ${r.question_number} [${r.marks}]:</b> ${r.question}<br>
-                <b>Your Answer:</b> ${studentDisplay}<br>
-                <b>Correct Answer:</b> ${correctDisplay}<br>
-                <b>AI Feedback:</b> ${r.feedback || "—"}<br>
-                <b>Status:</b> ${r.status} &nbsp;|&nbsp; <b>Earned:</b> ${r.earned}/${r.marks}
-            </div>`;
+  const maxWrong=Math.max(1,...(data.weak||[]).map(w=>w.wrong_count));
+  let html=`<div class="dash-card">
+    <h3>📉 Weak areas</h3>`;
+  if(data.weak&&data.weak.length){
+    data.weak.forEach(w=>{
+      const pct=Math.round((w.wrong_count/maxWrong)*100);
+      html+=`<div class="weak-item">
+        <span style="min-width:50px;font-weight:600">Q${w.question_number}</span>
+        <div class="weak-bar-bg"><div class="weak-bar" style="width:${pct}%"></div></div>
+        <span style="min-width:60px;color:#888">${w.wrong_count}x wrong</span>
+        <span style="font-size:12px;color:#aaa;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${w.question_text||''}</span>
+      </div>`;
     });
+  } else { html+=`<p style="color:#888;font-size:13px">No weak areas yet — take some exams!</p>`; }
+  html+=`</div>`;
 
-    const box = document.getElementById("resultsBox");
-    box.innerHTML = html;
-    box.classList.remove("hidden");
-    box.scrollIntoView({ behavior: "smooth" });
+  html+=`<div class="dash-card"><h3>📅 Recent sessions</h3>`;
+  if(data.sessions&&data.sessions.length){
+    data.sessions.forEach(s=>{
+      const col=s.percentage>=70?'#27ae60':s.percentage>=50?'#f39c12':'#e74c3c';
+      html+=`<div class="session-row">
+        <span>${s.exam_name.replace('_exam.json','').replace(/_/g,' ')}</span>
+        <span style="color:${col};font-weight:600">${s.score}/${s.total} (${s.percentage}%)</span>
+        <span style="color:#aaa;font-size:11px">${s.played_at.split(' ')[0]}</span>
+      </div>`;
+    });
+  } else { html+=`<p style="color:#888;font-size:13px">No sessions recorded yet.</p>`; }
+  html+=`</div>`;
+
+  html+=`<div class="dash-card"><h3>📋 Study plan</h3>`;
+  if(data.study_plan){
+    html+=`<p style="font-size:11px;color:#aaa;margin-bottom:6px">Updated: ${data.study_plan.updated_at}</p>
+      <div class="plan-text">${data.study_plan.plan}</div>`;
+  } else {
+    html+=`<p style="color:#888;font-size:13px">No study plan yet. Ask the AI Tutor: "Create a study plan for me"</p>`;
+  }
+  html+=`</div>`;
+
+  document.getElementById('dashboardArea').innerHTML=html;
 }
 </script>
 </body>
-</html>
-"""
+</html>"""
 
 
 # =========================
@@ -538,27 +552,61 @@ def list_exams():
 
 
 # =========================
+# 🤖 AGENT CHAT (replaces /chat)
+# =========================
+@app.route("/agent-chat", methods=["POST"])
+def agent_chat():
+    try:
+        data       = request.get_json()
+        student_id = data.get("student_id", "anonymous")
+        message    = data.get("message", "").strip()
+        if not message:
+            return jsonify({"response": "⚠️ Please enter a message."})
+
+        response = run_agent(student_id, message, rag=rag)
+        return jsonify({"response": response})
+
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"response": f"⚠️ Agent error: {e}"})
+
+
+# =========================
+# 🗑 CLEAR HISTORY
+# =========================
+@app.route("/clear-history", methods=["POST"])
+def clear_history():
+    data = request.get_json()
+    sid  = data.get("student_id", "")
+    mem.clear_history(sid)
+    return jsonify({"status": "cleared"})
+
+
+# =========================
 # ▶️ START EXAM SESSION
 # =========================
 @app.route("/start-exam", methods=["POST"])
 def start_exam():
     try:
-        data      = request.get_json()
-        exam_name = data.get("exam")
-        exam      = load_exam(exam_name)
+        data       = request.get_json()
+        exam_name  = data.get("exam")
+        student_id = data.get("student_id", "anonymous")
+        exam       = load_exam(exam_name)
 
         if not exam:
             return jsonify({"error": "❌ Exam not found"})
 
         flat = flatten_exam(exam)
         if not flat:
-            return jsonify({"error": "❌ No questions found in this exam"})
+            return jsonify({"error": "❌ No questions found"})
 
+        mem.ensure_student(student_id)
         sid = str(uuid.uuid4())
         sessions[sid] = {
-            "exam":      exam_name,
-            "questions": flat,
-            "answers":   {}
+            "exam":       exam_name,
+            "student_id": student_id,
+            "questions":  flat,
+            "answers":    {}
         }
 
         return jsonify({
@@ -582,16 +630,14 @@ def get_question():
         sid     = data.get("session_id")
         idx     = data.get("index", 0)
         session = sessions.get(sid)
-
         if not session:
             return jsonify({"error": "Invalid session"})
 
         flat = session["questions"]
         if idx < 0 or idx >= len(flat):
-            return jsonify({"error": "Question index out of range"})
+            return jsonify({"error": "Index out of range"})
 
         q = flat[idx].copy()
-        # Restore saved answer keyed by index string
         q["saved_answer"] = session["answers"].get(str(idx), "")
         return jsonify(q)
 
@@ -602,7 +648,6 @@ def get_question():
 
 # =========================
 # 💾 SAVE ANSWER
-# Keyed by str(index) in session["answers"]
 # =========================
 @app.route("/answer", methods=["POST"])
 def save_answer():
@@ -612,28 +657,24 @@ def save_answer():
         idx     = data.get("index")
         answer  = data.get("answer", "")
         session = sessions.get(sid)
-
         if not session:
             return jsonify({"error": "Invalid session"})
-
         session["answers"][str(idx)] = answer
-        return jsonify({"status": "saved", "index": idx, "length": len(str(answer))})
-
+        return jsonify({"status": "saved"})
     except Exception as e:
         return jsonify({"error": str(e)})
 
 
 # =========================
-# 📝 SUBMIT + AI MARK
-# Passes question_number alongside each question so model.py
-# can use it as the memo lookup key rather than array position.
+# 📝 SUBMIT + MARK + UPDATE MEMORY
 # =========================
 @app.route("/submit", methods=["POST"])
 def submit_exam():
     try:
-        data    = request.get_json()
-        sid     = data.get("session_id")
-        session = sessions.get(sid)
+        data       = request.get_json()
+        sid        = data.get("session_id")
+        student_id = data.get("student_id", "anonymous")
+        session    = sessions.get(sid)
 
         if not session:
             return jsonify({"error": "Invalid session"})
@@ -642,33 +683,95 @@ def submit_exam():
         flat      = session["questions"]
         answers   = session["answers"]
 
-        # Build per-question answer list with question_number attached
-        # so model.py never has to guess by index
+        # Attach student answers to question dicts
         questions_with_answers = []
         for i, q in enumerate(flat):
-            qcopy = dict(q)
-            qcopy["student_answer"] = answers.get(str(i), "")
-            questions_with_answers.append(qcopy)
+            qc = dict(q)
+            qc["student_answer"] = answers.get(str(i), "")
+            questions_with_answers.append(qc)
 
-        marked = mark_exam_batch(exam_name, questions_with_answers, answers)
+        # Mark all questions
+        results     = []
+        total_score = 0
+        total_marks = 0
 
-        for r in marked["results"]:
-            r["earned"] = r.get("score", 0)
+        for i, q in enumerate(questions_with_answers):
+            q_num    = q.get("question_number", f"Q{i+1}")
+            q_type   = q.get("type", "open").lower()
+            marks    = int(q.get("marks", 1))
+            q_text   = q.get("question", "")
+            memo     = q.get("memo", "")
+            student  = q.get("student_answer", "").strip()
+            options  = q.get("options")
 
-        feedback = generate_exam_feedback(
-            results    = marked["results"],
-            score      = marked["total_score"],
-            total      = marked["total_marks"],
-            percentage = marked["percentage"]
-        )
+            result = mark_answer(
+                question=q_text, question_number=q_num, q_type=q_type,
+                student_answer=student, memo=memo, marks=marks, options=options
+            )
+
+            # Update weak topic memory
+            if result.get("status") in ("incorrect", "missing"):
+                # Infer topic from parent_question
+                topic = q.get("parent_question", "").split(":")[1].strip() if ":" in q.get("parent_question","") else ""
+                mem.record_wrong(student_id, q_num, q_text, q_type, topic)
+            elif result.get("status") == "correct":
+                mem.record_correct(student_id, q_num)
+
+            # Build correct_answer display
+            if isinstance(memo, dict) and memo:
+                correct_display = " | ".join(f"{k.split()[0]} → {v}" for k,v in memo.items())
+            elif memo:
+                if q_type == "mcq" and options:
+                    correct_letter = str(memo).strip().upper()
+                    correct_display = correct_letter
+                    for opt in options:
+                        if isinstance(opt,dict) and opt.get("key","").upper() == correct_letter:
+                            correct_display = f"{correct_letter}. {opt['value']}"
+                            break
+                else:
+                    correct_display = str(memo)
+            else:
+                correct_display = "Not available"
+
+            result["question_number"] = q_num
+            result["question"]        = q_text
+            result["type"]            = q_type
+            result["marks"]           = marks
+            result["student_answer"]  = student or "No answer"
+            result["correct_answer"]  = correct_display
+            result["earned"]          = result.get("score", 0)
+
+            results.append(result)
+            total_score += result["earned"]
+            total_marks += marks
+
+        percentage = round((total_score / total_marks * 100), 1) if total_marks else 0
+
+        # Save session to memory
+        mem.save_session(student_id, exam_name, total_score, total_marks, percentage)
+
+        # AI overall feedback via agent (aware of student history)
+        from model import generate_exam_feedback
+        feedback = generate_exam_feedback(results, total_score, total_marks, percentage)
+
+        # Prompt agent to update study plan automatically
+        weak = mem.get_weak_topics(student_id)
+        if weak:
+            try:
+                run_agent(
+                    student_id,
+                    f"I just scored {percentage}% on {exam_name}. Please update my study plan based on my weak areas.",
+                    rag=rag
+                )
+            except Exception:
+                pass  # non-critical
 
         return jsonify({
-            "score":      marked["total_score"],
-            "total":      marked["total_marks"],
-            "percentage": marked["percentage"],
-            "results":    marked["results"],
-            "feedback":   feedback,
-            "message":    "✅ Exam submitted! Review your answers below 🚀"
+            "score":      total_score,
+            "total":      total_marks,
+            "percentage": percentage,
+            "results":    results,
+            "feedback":   feedback
         })
 
     except Exception as e:
@@ -677,35 +780,22 @@ def submit_exam():
 
 
 # =========================
-# 🧠 AI TUTOR
+# 📊 DASHBOARD DATA
 # =========================
-@app.route("/chat", methods=["POST"])
-def chat():
+@app.route("/dashboard", methods=["POST"])
+def dashboard():
     try:
-        data     = request.get_json()
-        question = data.get("question", "")
-        mode     = data.get("mode", "tutor")
-
-        if not question:
-            return jsonify({"answer": "⚠️ Please enter a question."})
-
-        if mode == "tutor":
-            chunks  = rag.search(question)
-            context = " ".join(
-                c["content"] if isinstance(c, dict) and "content" in c else str(c)
-                for c in chunks
-            )
-            answer = generate_answer(context, question)
-            return jsonify({"answer": answer})
-
-        return jsonify({"answer": "⚠️ Invalid mode."})
-
+        data       = request.get_json()
+        student_id = data.get("student_id", "anonymous")
+        mem.ensure_student(student_id)
+        return jsonify({
+            "weak":       mem.get_weak_topics(student_id),
+            "sessions":   mem.get_sessions(student_id, limit=8),
+            "study_plan": mem.get_study_plan(student_id)
+        })
     except Exception as e:
-        return jsonify({"answer": f"⚠️ Server error: {str(e)}"})
+        return jsonify({"error": str(e)})
 
 
-# =========================
-# ▶️ RUN
-# =========================
 if __name__ == "__main__":
     app.run(debug=True, port=8000)
