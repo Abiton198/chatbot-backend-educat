@@ -5,217 +5,143 @@ import time
 from groq import Groq, RateLimitError, AuthenticationError
 from dotenv import load_dotenv
 
-# =========================
-# 🔑 LOAD ENV & CLIENT
-# =========================
 load_dotenv()
-
 api_key = os.getenv("GROQ_API_KEY")
 if not api_key:
     raise ValueError("❌ GROQ_API_KEY is not set.")
-
 client = Groq(api_key=api_key)
 
-# =========================
-# 📁 PATHS
-# =========================
 PROCESSED_FOLDER = "processed"
 OUTPUT_FOLDER    = "exams"
 TRACK_FILE       = "processed_exams.json"
-
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
-# =========================
-# 🗂️ FILE CLASSIFICATION
-#
-# Files are accepted ONLY if they match exam OR memo patterns.
-# Everything else (theory books, notes, textbooks etc.) is ignored.
-#
-# EXAM keywords  — words that indicate a question paper
-# MEMO keywords  — words that indicate a memo/answer file
-# NOISE words    — stripped before keyword matching
-# =========================
+WINDOW_CHARS  = 6000
+OVERLAP_CHARS = 500
 
-EXAM_KEYWORDS = [
-    "exam", "paper", "question", "theory", "p1", "p2", "p3",
-    "nov", "november", "may", "june", "feb", "february",
-    "march", "mar", "aug", "august", "sep", "september",
-    "oct", "october", "term", "trial", "nsc", "dbe", "cat",
-]
+# ── normalisation ────────────────────────────────────────
+def normalize_key(filename):
+    name = filename.strip().lower()
+    name = re.sub(r'\s+\.', '.', name)
+    return name
 
-MEMO_KEYWORDS = [
-    "memo", "memorandum", "answers", "answer_key", "marking",
-]
-
-NOISE_WORDS = {
-    "memo", "memorandum", "answers", "answer", "marking", "key",
-    "theory", "exam", "paper", "nsc", "dbe", "grade", "gr",
-    "cat", "caps", "p1", "p2", "p3", "question", "chunks",
-    "nov", "november", "oct", "october", "jun", "june",
-    "feb", "february", "mar", "march", "aug", "august",
-    "sep", "september", "jan", "january", "jul", "july",
-    "apr", "april", "dec", "december",
-}
-
+# ── classification ───────────────────────────────────────
+EXAM_KEYWORDS = ["exam","paper","question","theory","p1","p2","p3",
+                 "nov","november","may","june","feb","february","march","mar",
+                 "aug","august","sep","september","oct","october","term",
+                 "trial","nsc","dbe","cat"]
+MEMO_KEYWORDS = ["memo","memorandum","answers","answer_key","marking"]
+NOISE_WORDS   = {"memo","memorandum","answers","answer","marking","key",
+                 "theory","exam","paper","nsc","dbe","grade","gr","cat",
+                 "caps","p1","p2","p3","question","chunks","nov","november",
+                 "oct","october","jun","june","feb","february","mar","march",
+                 "aug","august","sep","september","jan","january","jul","july",
+                 "apr","april","dec","december"}
 MONTH_CANONICAL = {
-    "jan": "january",   "january": "january",
-    "feb": "february",  "february": "february",
-    "mar": "march",     "march": "march",
-    "apr": "april",     "april": "april",
-    "may": "may",
-    "jun": "june",      "june": "june",
-    "jul": "july",      "july": "july",
-    "aug": "august",    "august": "august",
-    "sep": "september", "september": "september",
-    "oct": "october",   "october": "october",
-    "nov": "november",  "november": "november",
-    "dec": "december",  "december": "december",
-}
-
+    "jan":"january","january":"january","feb":"february","february":"february",
+    "mar":"march","march":"march","apr":"april","april":"april","may":"may",
+    "jun":"june","june":"june","jul":"july","july":"july",
+    "aug":"august","august":"august","sep":"september","september":"september",
+    "oct":"october","october":"october","nov":"november","november":"november",
+    "dec":"december","december":"december"}
 
 def classify_file(filename):
-    """
-    Returns: "exam" | "memo" | "skip"
-
-    Logic:
-    - If filename contains a MEMO keyword → "memo"
-    - Elif filename contains an EXAM keyword → "exam"
-    - Else → "skip" (theory book, notes, unknown etc.)
-    """
     lower = filename.lower()
-
-    # Check memo first (memo files often also contain exam keywords)
-    if any(kw in lower for kw in MEMO_KEYWORDS):
-        return "memo"
-
-    if any(kw in lower for kw in EXAM_KEYWORDS):
-        return "exam"
-
+    if any(kw in lower for kw in MEMO_KEYWORDS): return "memo"
+    if any(kw in lower for kw in EXAM_KEYWORDS): return "exam"
     return "skip"
 
-
 def extract_keywords(filename):
-    """
-    Pull year, month, term, paper number from a filename.
-    Strips noise words so matching is based on signal only.
-    e.g. "may_memo_2025.json"       → {"may", "2025"}
-         "May_Theory_2025.json"     → {"may", "2025"}
-         "Nov_Theory_2024_exam.json"→ {"november", "2024"}
-    """
-    name = filename.lower()
+    name = filename.lower().strip()
+    name = re.sub(r'\s+\.', '.', name)
     name = re.sub(r"\.(json|pdf)$", "", name)
     name = re.sub(r"_(exam|chunks)$", "", name)
     tokens = re.split(r"[^a-z0-9]+", name)
-
     keywords = set()
     for token in tokens:
-        if not token:
-            continue
-        if token in MONTH_CANONICAL:
-            keywords.add(MONTH_CANONICAL[token])
-            continue
-        if re.match(r"^\d{4}$", token):
-            keywords.add(token)
-            continue
-        if re.match(r"^(term|t)\d$", token):
-            keywords.add(token)
-            continue
-        if re.match(r"^p\d$", token):
-            keywords.add(token)
-            continue
-        if token in NOISE_WORDS:
-            continue
-        if len(token) >= 2:
-            keywords.add(token)
-
+        if not token: continue
+        if token in MONTH_CANONICAL: keywords.add(MONTH_CANONICAL[token]); continue
+        if re.match(r"^\d{4}$", token): keywords.add(token); continue
+        if re.match(r"^(term|t)\d$", token): keywords.add(token); continue
+        if re.match(r"^p\d$", token): keywords.add(token); continue
+        if token in NOISE_WORDS: continue
+        if len(token) >= 2: keywords.add(token)
     return keywords
 
-
-# =========================
-# 📋 TRACKING HELPERS
-# Track processed pairs so re-running skips done work
-# Format: { "exam_file.json": { "exam_done": true, "memo_merged": true, "memo_source": "..." } }
-# =========================
+# ── tracker ──────────────────────────────────────────────
 def load_tracker():
-    if not os.path.exists(TRACK_FILE):
-        return {}
+    if not os.path.exists(TRACK_FILE): return {}
     try:
-        with open(TRACK_FILE) as f:
-            data = json.load(f)
-            # Migrate old list format
-            if isinstance(data, list):
-                print("⚙️  Migrating old tracker format...")
-                return {name: {"exam_done": False, "memo_merged": False} for name in data}
-            return data
+        with open(TRACK_FILE) as f: data = json.load(f)
     except Exception:
-        print(f"⚠️  Could not read {TRACK_FILE}, starting fresh.")
-        return {}
+        print("⚠️  Could not read tracker, starting fresh."); return {}
+    if isinstance(data, list):
+        data = {n: {"exam_done": False, "memo_merged": False} for n in data}
+    normalised = {}
+    for raw_key, value in data.items():
+        nk = normalize_key(raw_key)
+        if nk not in normalised:
+            normalised[nk] = {"exam_done": False, "memo_merged": False, "memo_source": None}
+        if value.get("exam_done"):    normalised[nk]["exam_done"]   = True
+        if value.get("memo_merged"):  normalised[nk]["memo_merged"] = True
+        if value.get("memo_source"):  normalised[nk]["memo_source"] = value["memo_source"]
+    if normalised != data:
+        print(f"⚙️  Normalised tracker: {len(data)} raw → {len(normalised)} unique keys")
+        with open(TRACK_FILE, "w") as f: json.dump(normalised, f, indent=2)
+    return normalised
 
 def save_tracker(tracker):
-    with open(TRACK_FILE, "w") as f:
-        json.dump(tracker, f, indent=2)
+    with open(TRACK_FILE, "w") as f: json.dump(tracker, f, indent=2)
+
+def tracker_get(tracker, filename): return tracker.get(normalize_key(filename), {})
+def tracker_set(tracker, filename, key, value):
+    nk = normalize_key(filename)
+    if nk not in tracker: tracker[nk] = {}
+    tracker[nk][key] = value
 
 def output_path_for(exam_chunk_file):
-    return os.path.join(OUTPUT_FOLDER, exam_chunk_file.replace(".json", "_exam.json"))
+    stem = re.sub(r"\.json$", "", normalize_key(exam_chunk_file))
+    return os.path.join(OUTPUT_FOLDER, stem + "_exam.json")
 
-def exam_output_exists(exam_chunk_file):
-    return os.path.exists(output_path_for(exam_chunk_file))
+def exam_output_exists(f): return os.path.exists(output_path_for(f))
 
-
-# =========================
-# 🔍 MATCH MEMO → EXAM
-# =========================
+# ── matching ─────────────────────────────────────────────
 def find_matching_exam(memo_filename, exam_chunk_files):
-    """
-    Match a memo file to its exam chunk file using shared keywords.
-    Returns (best_match_filename, shared_keywords, score) or (None, set(), 0)
-    """
     memo_kw = extract_keywords(memo_filename)
-    if not memo_kw:
-        return None, set(), 0
-
-    best_file   = None
-    best_shared = set()
-    best_score  = 0
-
+    if not memo_kw: return None, set(), 0
+    best_file, best_shared, best_score = None, set(), 0
     for exam_file in exam_chunk_files:
         exam_kw = extract_keywords(exam_file)
         shared  = memo_kw & exam_kw
-        if not shared:
-            continue
+        if not shared: continue
         score = len(shared) / len(memo_kw | exam_kw)
         if score > best_score:
-            best_score  = score
-            best_shared = shared
-            best_file   = exam_file
+            best_score, best_shared, best_file = score, shared, exam_file
+    return (best_file, best_shared, best_score) if best_file else (None, set(), 0)
 
-    if best_file and best_score > 0:
-        return best_file, best_shared, best_score
+# ── chunk stitching ──────────────────────────────────────
+def stitch_chunks(chunks):
+    return "\n".join(c.get("content","").strip() for c in chunks if c.get("content","").strip())
 
-    return None, set(), 0
+def sliding_windows(text, window=WINDOW_CHARS, overlap=OVERLAP_CHARS):
+    start = 0
+    while start < len(text):
+        end = start + window
+        yield text[start:end]
+        if end >= len(text): break
+        start = end - overlap
 
-
-# =========================
-# 🧠 EXTRACT QUESTIONS
-# =========================
+# ── LLM: extract questions ───────────────────────────────
 def extract_questions(text):
-    prompt = f"""
-You are an expert parser for South African NSC (National Senior Certificate) CAT exam papers.
+    prompt = f"""You are an expert parser for South African NSC CAT exam papers.
+Extract all questions. Return ONLY a valid JSON array, no markdown, no backticks.
 
-Extract the FULL structure EXACTLY as it appears. Do not skip any questions.
-
-PAPER STRUCTURE:
-  SECTION A (Q1–3): MCQ, Matching, True/False
-  SECTION B (Q4–8): Open sub-questions e.g. 4.1, 4.7.1
-  SECTION C (Q9–10): Scenario sub-questions e.g. 9.3.2
-
-Return ONLY valid JSON (no markdown, no backticks):
-
+Format:
 [
   {{
     "section": "A",
     "section_title": "SECTION A",
-    "section_instructions": "Answer ALL the questions.",
+    "section_instructions": "Answer ALL questions.",
     "total_marks": 25,
     "questions": [
       {{
@@ -223,9 +149,9 @@ Return ONLY valid JSON (no markdown, no backticks):
         "question_number": "1.1",
         "parent_question": "QUESTION 1: MULTIPLE-CHOICE QUESTIONS",
         "parent_context": null,
-        "question": "Full question text exactly as written",
+        "question": "Exact question text",
         "type": "mcq",
-        "options": {{"A": "text", "B": "text", "C": "text", "D": "text"}},
+        "options": {{"A": "Trackball", "B": "Stylus", "C": "Touchpad", "D": "Mouse"}},
         "marks": 1,
         "memo": ""
       }},
@@ -233,11 +159,11 @@ Return ONLY valid JSON (no markdown, no backticks):
         "id": 2,
         "question_number": "2",
         "parent_question": "QUESTION 2: MATCHING ITEMS",
-        "parent_context": "Choose a term from COLUMN B that matches COLUMN A.",
-        "question": "Match all items in COLUMN A to COLUMN B",
+        "parent_context": "Choose from COLUMN B.",
+        "question": "Match COLUMN A to COLUMN B",
         "type": "matching",
-        "column_a": ["2.1 description one", "2.2 description two"],
-        "column_b": ["A. term1", "B. term2", "R. term3"],
+        "column_a": ["2.1 Integration of two or more technologies"],
+        "column_b": ["A. #Value!", "R. convergence"],
         "marks": 10,
         "memo": {{}}
       }},
@@ -245,8 +171,8 @@ Return ONLY valid JSON (no markdown, no backticks):
         "id": 3,
         "question_number": "3.1",
         "parent_question": "QUESTION 3: TRUE/FALSE ITEMS",
-        "parent_context": "Write TRUE or FALSE. If FALSE, correct the underlined word.",
-        "question": "The CPU is responsible for processing instructions.",
+        "parent_context": "Write TRUE or FALSE.",
+        "question": "The CPU processes instructions.",
         "type": "true_false",
         "options": null,
         "marks": 1,
@@ -257,18 +183,7 @@ Return ONLY valid JSON (no markdown, no backticks):
         "question_number": "4.1",
         "parent_question": "QUESTION 4: SYSTEMS TECHNOLOGIES",
         "parent_context": null,
-        "question": "State TWO disadvantages of using a wireless mouse.",
-        "type": "open",
-        "options": null,
-        "marks": 2,
-        "memo": ""
-      }},
-      {{
-        "id": 5,
-        "question_number": "4.7.1",
-        "parent_question": "QUESTION 4: SYSTEMS TECHNOLOGIES",
-        "parent_context": "One of the functions of an operating system is to manage programs and users.",
-        "question": "Explain the difference between a single-user system and a multi-user system.",
+        "question": "State TWO disadvantages of a wireless mouse.",
         "type": "open",
         "options": null,
         "marks": 2,
@@ -279,219 +194,180 @@ Return ONLY valid JSON (no markdown, no backticks):
 ]
 
 RULES:
-- question_number = exact label as printed (1.1, 4.7.1, 9.3.2)
-- parent_question = heading of the parent question block
-- parent_context  = scenario/context sentence before sub-questions, or null
-- marks = number in (brackets), default 1
-- memo  = ALWAYS leave as "" or {{}} — filled later from memo file
-- NEVER invent memo answers
-
-SECTION MAPPING:
-  Q1–3  → section "A"
-  Q4–8  → section "B"
-  Q9–10 → section "C"
-
-TYPES:
-  mcq        → Q1: options dict A/B/C/D
-  matching   → Q2: ONE question, column_a and column_b lists, memo = {{}}
-  true_false → Q3: one per 3.x number
-  open       → all Section B and C sub-questions
+- question_number = exact label (1.1, 2.1, 3.2, 4.7.1, 9.3.2, 10.3.2)
+- MCQ options MUST be dict with keys "A","B","C","D" and full text values
+- matching: ONE object, column_a = ["2.1 description", ...], column_b = ["A. term", ...]
+- true_false: one object per 3.x sub-number
+- marks = integer from (N) at end, default 1
+- memo = always "" (non-matching) or {{}} (matching), NEVER fill answers
+- Section mapping: Q1-3 → "A", Q4-8 → "B", Q9-10 → "C"
 
 TEXT:
-{text}
-"""
+{text}"""
     try:
-        response = client.chat.completions.create(
+        r = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0
-        )
-    except AuthenticationError:
-        print("❌ Invalid API key"); return []
-    except RateLimitError:
-        print("⚠️ Rate limit hit, waiting 10s..."); time.sleep(10); return []
-    except Exception as e:
-        print(f"❌ API error: {e}"); return []
-
-    content = response.choices[0].message.content.strip()
+            messages=[{"role":"user","content":prompt}],
+            temperature=0)
+    except AuthenticationError: print("❌ Invalid API key"); return []
+    except RateLimitError: print("⚠️ Rate limit, waiting 15s..."); time.sleep(15); return []
+    except Exception as e: print(f"❌ API error: {e}"); return []
+    content = r.choices[0].message.content.strip()
     if content.startswith("```"):
         content = content.split("```")[1]
-        if content.startswith("json"):
-            content = content[4:]
+        if content.startswith("json"): content = content[4:]
         content = content.strip()
-
     try:
         parsed = json.loads(content)
         return parsed if isinstance(parsed, list) else []
     except json.JSONDecodeError as e:
-        print(f"❌ JSON parse failed: {e}")
-        print(f"📝 Preview: {content[:300]}")
-        return []
+        print(f"❌ JSON parse failed: {e}\n📝 {content[:300]}"); return []
 
-
-# =========================
-# 🧠 EXTRACT MEMO ANSWERS
-# =========================
+# ── LLM: extract memo ────────────────────────────────────
 def extract_memo_answers(text):
-    prompt = f"""
-You are an expert parser for South African NSC CAT exam MEMO (marking guideline) files.
+    prompt = f"""You are an expert parser for South African NSC CAT exam MEMO files.
+Extract ALL answers. Return ONLY a valid JSON object, no markdown, no backticks.
 
-Extract ALL answers. Return ONLY valid JSON (no markdown):
-
+Format:
 {{
   "1.1": "C",
-  "1.2": "A",
+  "1.2": "C",
   "2.1": "R",
-  "2.2": "E",
   "3.1": "True",
-  "3.2": "False — secondary memory",
-  "4.1": "Full answer text / alternative answer",
-  "4.7.1": "Full answer text"
+  "3.2": "False - Braille",
+  "4.1": "Can be lost/stolen / Batteries need replacing / Signal interference",
+  "4.7.1": "Single-user: one user at a time / Multi-user: multiple users simultaneously"
 }}
 
-RULES:
-- Key   = question number exactly as printed (1.1, 4.7.1, 9.3.2)
-- MCQ (Q1)       : value = correct letter only e.g. "C"
-- Matching (Q2)  : extract each separately — "2.1": "R", "2.2": "E" etc.
-- True/False (Q3): value = "True" OR "False — corrected word"
-- Open (Q4–10)   : value = full expected answer, join marking points with " / "
-- Extract EVERY answer — do NOT skip any
+STRICT RULES:
+- Key = question number EXACTLY as printed (1.1, 2.3, 3.5, 4.7.1, 9.3.2, 10.3.2)
+- Q1.x MCQ answers    : single letter only — "C" not "C Touchpad"
+- Q2.x matching      : single letter only — "R" not "R convergence"  
+- Q3.x true/false    : "True" OR "False - corrected word"
+- Q4-10 open answers : full text, join alternatives with " / "
+- Extract EVERY answer, do NOT skip any
 - Return ONLY the JSON object
 
 TEXT:
-{text}
-"""
+{text}"""
     try:
-        response = client.chat.completions.create(
+        r = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0
-        )
-    except AuthenticationError:
-        print("❌ Invalid API key"); return {}
-    except RateLimitError:
-        print("⚠️ Rate limit hit, waiting 10s..."); time.sleep(10); return {}
-    except Exception as e:
-        print(f"❌ API error: {e}"); return {}
-
-    content = response.choices[0].message.content.strip()
+            messages=[{"role":"user","content":prompt}],
+            temperature=0)
+    except AuthenticationError: print("❌ Invalid API key"); return {}
+    except RateLimitError: print("⚠️ Rate limit, waiting 15s..."); time.sleep(15); return {}
+    except Exception as e: print(f"❌ API error: {e}"); return {}
+    content = r.choices[0].message.content.strip()
     if content.startswith("```"):
         content = content.split("```")[1]
-        if content.startswith("json"):
-            content = content[4:]
+        if content.startswith("json"): content = content[4:]
         content = content.strip()
-
     try:
         parsed = json.loads(content)
         return parsed if isinstance(parsed, dict) else {}
     except json.JSONDecodeError as e:
-        print(f"❌ JSON parse failed: {e}")
-        print(f"📝 Preview: {content[:300]}")
-        return {}
+        print(f"❌ JSON parse failed: {e}\n📝 {content[:300]}"); return {}
 
-
-# =========================
-# 🔗 MERGE SECTIONS
-# =========================
+# ── merge & dedup ─────────────────────────────────────────
 def merge_sections(all_sections):
     merged = {}
     order  = {"A": 0, "B": 1, "C": 2}
     for section in all_sections:
         label = section.get("section", "A").strip().upper()
         if label not in merged:
-            merged[label] = {
-                "section":              label,
-                "section_title":        section.get("section_title"),
-                "section_instructions": section.get("section_instructions"),
-                "total_marks":          section.get("total_marks"),
-                "questions":            []
-            }
-        else:
-            for field in ["section_title", "section_instructions", "total_marks"]:
-                if not merged[label][field] and section.get(field):
-                    merged[label][field] = section.get(field)
+            merged[label] = {**section, "questions": []}
+        for field in ["section_title", "section_instructions", "total_marks"]:
+            if not merged[label].get(field) and section.get(field):
+                merged[label][field] = section[field]
         merged[label]["questions"].extend(section.get("questions", []))
     return sorted(merged.values(), key=lambda s: order.get(s["section"], 99))
 
+def question_completeness(q):
+    score = len(q.get("question") or "")
+    if isinstance(q.get("options"), dict): score += len(q["options"]) * 20
+    if q.get("column_a"): score += len(q["column_a"]) * 10
+    return score
 
-# =========================
-# 🧹 DEDUPLICATE & RE-ID
-# =========================
 def deduplicate_and_renumber(sections):
-    seen = set()
-    qid  = 1
+    best = {}
     for section in sections:
-        clean = []
         for q in section.get("questions", []):
-            key = f"{q.get('question_number','')}|{q.get('question','')[:80]}"
-            if not q.get("question") or key in seen:
-                continue
-            seen.add(key)
-            q["id"] = qid
-            qid += 1
-            clean.append(q)
-        section["questions"] = clean
-    return sections, qid - 1
+            qn = q.get("question_number", "").strip()
+            if not qn or not q.get("question"): continue
+            if qn not in best or question_completeness(q) > question_completeness(best[qn]):
+                best[qn] = dict(q)
+                best[qn]["_section"] = section["section"]
 
+    section_map = {}
+    qid = 1
+    def sort_key(x):
+        parts = x.split(".")
+        try: return [int(p) for p in parts]
+        except: return parts
+    for qn in sorted(best.keys(), key=sort_key):
+        q = best[qn]
+        sec = q.pop("_section", "A")
+        q["id"] = qid; qid += 1
+        section_map.setdefault(sec, []).append(q)
 
-# =========================
-# 🔗 INJECT MEMO ANSWERS
-# =========================
+    order = {"A": 0, "B": 1, "C": 2}
+    sec_meta = {s["section"]: s for s in sections}
+    rebuilt = []
+    for sec_label in sorted(section_map.keys(), key=lambda x: order.get(x, 99)):
+        meta = sec_meta.get(sec_label, {})
+        rebuilt.append({
+            "section":              sec_label,
+            "section_title":        meta.get("section_title"),
+            "section_instructions": meta.get("section_instructions"),
+            "total_marks":          meta.get("total_marks"),
+            "questions":            section_map[sec_label]
+        })
+    return rebuilt, qid - 1
+
+# ── inject memo ───────────────────────────────────────────
 def inject_memo_answers(exam_data, memo_answers):
-    matched   = 0
-    unmatched = []
-
-    # Build sub-number → full column_a label map for matching questions
-    col_a_map = {}
-    for section in exam_data.get("sections", []):
-        for q in section.get("questions", []):
-            if q.get("type") == "matching":
-                for item in q.get("column_a", []):
-                    parts = item.strip().split(" ", 1)
-                    if parts:
-                        col_a_map[parts[0].rstrip(".")] = item
-
+    matched, unmatched = 0, []
     for section in exam_data.get("sections", []):
         for q in section.get("questions", []):
             q_num  = q.get("question_number", "").strip()
             q_type = q.get("type", "open")
-
             if q_type == "matching":
-                memo_dict = {
-                    label: memo_answers[num]
-                    for num, label in col_a_map.items()
-                    if num in memo_answers
-                }
-                if memo_dict:
-                    q["memo"] = memo_dict
-                    matched += len(memo_dict)
-                else:
-                    unmatched.append(q_num)
+                memo_dict = {}
+                for item in q.get("column_a", []):
+                    m = re.match(r"^(\d+\.\d+)", item.strip())
+                    if m:
+                        sub = m.group(1)
+                        if sub in memo_answers:
+                            memo_dict[item] = memo_answers[sub]
+                            matched += 1
+                if memo_dict: q["memo"] = memo_dict
+                else: unmatched.append(q_num)
             else:
                 if q_num in memo_answers:
-                    q["memo"] = memo_answers[q_num]
-                    matched += 1
+                    q["memo"] = memo_answers[q_num]; matched += 1
                 else:
                     unmatched.append(q_num)
-
     return exam_data, matched, unmatched
 
+def validate_memo_injection(exam_data, memo_answers):
+    print("\n    📋 MEMO VALIDATION — Section A spot-check:")
+    for section in exam_data.get("sections", []):
+        if section["section"] != "A": continue
+        for q in section.get("questions", []):
+            qn   = q.get("question_number","")
+            memo = q.get("memo","")
+            raw  = memo_answers.get(qn, "NOT IN MEMO")
+            ok   = "✅" if memo and memo == raw else "⚠️ "
+            print(f"      {ok} {qn}: stored={repr(str(memo)):30s} raw={repr(raw)}")
 
-# =========================
-# 📊 COUNT TYPES
-# =========================
 def count_types(sections):
     counts = {"mcq": 0, "matching": 0, "true_false": 0, "open": 0}
     for section in sections:
         for q in section.get("questions", []):
-            t = q.get("type", "open")
-            counts[t] = counts.get(t, 0) + 1
+            t = q.get("type","open"); counts[t] = counts.get(t,0) + 1
     return counts
 
-
-# =========================
-# 📥 LOAD CHUNKS
-# =========================
 def load_chunks(filename):
     path = os.path.join(PROCESSED_FOLDER, filename)
     try:
@@ -499,230 +375,134 @@ def load_chunks(filename):
             data = json.load(f)
             return data if isinstance(data, list) else []
     except Exception as e:
-        print(f"  ❌ Failed to load {filename}: {e}")
-        return []
+        print(f"  ❌ Failed to load {filename}: {e}"); return []
 
-
-# =========================
-# 🔄 MAIN PROCESSOR
-# =========================
+# ── main ──────────────────────────────────────────────────
 def process():
-
     if not os.path.exists(PROCESSED_FOLDER):
-        print(f"❌ Folder '{PROCESSED_FOLDER}' not found.")
-        return
+        print(f"❌ Folder '{PROCESSED_FOLDER}' not found."); return
 
     tracker = load_tracker()
+    SKIP = {"metadata.json","chunk_ids.json","processed_files.json","processed_exams.json"}
+    all_json = [f for f in sorted(os.listdir(PROCESSED_FOLDER))
+                if f.endswith(".json") and f not in SKIP]
 
-    all_json = [
-        f for f in sorted(os.listdir(PROCESSED_FOLDER))
-        if f.endswith(".json")
-        and f not in ["metadata.json", "chunk_ids.json", "processed_files.json", "processed_exams.json"]
-    ]
-
-    # ── Classify every file ───────────────────────────────
-    exam_files = []
-    memo_files = []
-    skipped    = []
-
+    exam_files, memo_files, skipped = [], [], []
     for f in all_json:
         kind = classify_file(f)
-        if kind == "exam":
-            exam_files.append(f)
-        elif kind == "memo":
-            memo_files.append(f)
-        else:
-            skipped.append(f)
+        if kind == "exam": exam_files.append(f)
+        elif kind == "memo": memo_files.append(f)
+        else: skipped.append(f)
 
-    # ── Print pre-flight summary ──────────────────────────
-    print(f"\n{'='*50}")
-    print(f"📂 Files in processed/ : {len(all_json)}")
-    print(f"📄 Exam papers         : {len(exam_files)}")
+    print(f"\n{'='*55}")
+    print(f"📂 Files: {len(all_json)}  |  Exams: {len(exam_files)}  |  Memos: {len(memo_files)}  |  Skipped: {len(skipped)}")
     for f in exam_files:
-        status = "✅ done" if tracker.get(f, {}).get("exam_done") and exam_output_exists(f) else "🔄 pending"
-        print(f"     {status}  → {f}")
-    print(f"📝 Memo files          : {len(memo_files)}")
+        e = tracker_get(tracker, f)
+        s = "✅+memo" if e.get("exam_done") and e.get("memo_merged") else "✅ done" if e.get("exam_done") else "🔄"
+        print(f"  {s}  {f}")
     for f in memo_files:
-        status = "✅ merged" if tracker.get(f, {}).get("memo_merged") else "🔄 pending"
-        print(f"     {status}  → {f}")
-    print(f"🚫 Ignored (not exam)  : {len(skipped)}")
-    for f in skipped:
-        print(f"     → {f}")
-    print(f"{'='*50}\n")
+        s = "✅ merged" if tracker_get(tracker,f).get("memo_merged") else "🔄"
+        print(f"  {s}  {f}")
+    print(f"{'='*55}\n")
 
-    if not exam_files and not memo_files:
-        print("⚠️  No exam or memo files found.")
-        print("💡 Name your files with keywords like:")
-        print("   Exam : nov, may, june, theory, paper, exam, p1, p2, term, nsc, dbe, cat")
-        print("   Memo : memo, memorandum, answers, marking")
-        return
-
-    # ══════════════════════════════════════════════════════
-    # STEP 1 — Extract questions from exam papers
-    # ══════════════════════════════════════════════════════
-    pending_exams = [
-        f for f in exam_files
-        if not (tracker.get(f, {}).get("exam_done") and exam_output_exists(f))
-    ]
-
-    if pending_exams:
-        print(f"📄 STEP 1: Extracting questions from {len(pending_exams)} exam paper(s)...\n")
-    else:
-        print("📄 STEP 1: All exam papers already extracted.\n")
+    # STEP 1
+    pending_exams = [f for f in exam_files
+                     if not (tracker_get(tracker,f).get("exam_done") and exam_output_exists(f))]
+    print(f"📄 STEP 1: {len(pending_exams)} exam(s) to extract\n")
 
     for idx, exam_file in enumerate(pending_exams, 1):
-        print(f"  [{idx}/{len(pending_exams)}] 📄 {exam_file}")
-
+        print(f"  [{idx}/{len(pending_exams)}] {exam_file}")
         chunks = load_chunks(exam_file)
-        if not chunks:
-            print(f"    ⚠️  Empty or invalid — skipping.\n")
-            continue
+        if not chunks: print("    ⚠️  Empty\n"); continue
 
-        all_raw_sections = []
-        for i, chunk in enumerate(chunks):
-            text = chunk.get("content", "").strip()
-            if not text:
-                continue
-            print(f"    🔍 Chunk {i + 1}/{len(chunks)}...")
-            extracted = extract_questions(text)
-            if extracted:
-                all_raw_sections.extend(extracted)
+        full_text = stitch_chunks(chunks)
+        windows   = list(sliding_windows(full_text))
+        print(f"    🔗 {len(chunks)} chunks → {len(full_text)} chars → {len(windows)} windows")
+
+        all_raw = []
+        for i, window in enumerate(windows):
+            print(f"    🔍 Window {i+1}/{len(windows)}...")
+            extracted = extract_questions(window)
+            if extracted: all_raw.extend(extracted)
             time.sleep(1.5)
 
-        if not all_raw_sections:
-            print(f"    ⚠️  Nothing extracted — will retry next run.\n")
-            continue
+        if not all_raw: print("    ⚠️  Nothing extracted\n"); continue
 
-        sections, total_q = deduplicate_and_renumber(merge_sections(all_raw_sections))
-        type_counts        = count_types(sections)
-
+        sections, total_q = deduplicate_and_renumber(merge_sections(all_raw))
+        type_counts = count_types(sections)
         out_path = output_path_for(exam_file)
         with open(out_path, "w") as f:
-            json.dump({
-                "source":          exam_file,
-                "total_questions": total_q,
-                "type_breakdown":  type_counts,
-                "memo_merged":     False,
-                "memo_source":     None,
-                "sections":        sections
-            }, f, indent=2)
-
-        print(f"    💾 Saved  : {out_path}")
-        print(f"    📊 {total_q} questions | "
-              f"MCQ: {type_counts['mcq']} | Matching: {type_counts['matching']} | "
-              f"T/F: {type_counts['true_false']} | Open: {type_counts['open']}\n")
-
-        if exam_file not in tracker:
-            tracker[exam_file] = {}
-        tracker[exam_file]["exam_done"]   = True
-        tracker[exam_file]["memo_merged"] = False
+            json.dump({"source":exam_file,"total_questions":total_q,
+                       "type_breakdown":type_counts,"memo_merged":False,
+                       "memo_source":None,"sections":sections}, f, indent=2)
+        print(f"    💾 {out_path}  |  {total_q}q  MCQ:{type_counts['mcq']} Match:{type_counts['matching']} T/F:{type_counts['true_false']} Open:{type_counts['open']}\n")
+        tracker_set(tracker, exam_file, "exam_done",   True)
+        tracker_set(tracker, exam_file, "memo_merged", False)
         save_tracker(tracker)
 
-    # ══════════════════════════════════════════════════════
-    # STEP 2 — Extract & merge memo answers
-    # ══════════════════════════════════════════════════════
-    pending_memos = [
-        f for f in memo_files
-        if not tracker.get(f, {}).get("memo_merged")
-    ]
-
-    if pending_memos:
-        print(f"\n📝 STEP 2: Merging {len(pending_memos)} memo file(s) into exams...\n")
-    else:
-        print("📝 STEP 2: All memos already merged.\n")
-
-    # Available exam output files for matching
-    available_exam_outputs = [
-        f for f in os.listdir(OUTPUT_FOLDER)
-        if f.endswith("_exam.json")
-    ]
+    # STEP 2
+    pending_memos = [f for f in memo_files if not tracker_get(tracker,f).get("memo_merged")]
+    print(f"\n📝 STEP 2: {len(pending_memos)} memo(s) to merge\n")
 
     for idx, memo_file in enumerate(pending_memos, 1):
-        print(f"  [{idx}/{len(pending_memos)}] 📝 {memo_file}")
-
+        print(f"  [{idx}/{len(pending_memos)}] {memo_file}")
         memo_kw = extract_keywords(memo_file)
-        print(f"    🔑 Keywords : {sorted(memo_kw)}")
+        print(f"    🔑 {sorted(memo_kw)}")
 
         matched_exam, shared_kw, score = find_matching_exam(memo_file, exam_files)
-
-        if not matched_exam:
-            print(f"    ⚠️  No matching exam found.")
-            print(f"    💡 Available exam files: {exam_files}")
-            print(f"    💡 Make sure the exam and memo share year/month in their filenames.\n")
-            continue
+        if not matched_exam: print(f"    ⚠️  No match. Exams: {exam_files}\n"); continue
 
         exam_output = output_path_for(matched_exam)
+        if not os.path.exists(exam_output): print(f"    ⚠️  Missing: {exam_output}\n"); continue
+        if not tracker_get(tracker, matched_exam).get("exam_done"):
+            print(f"    ⚠️  Exam not yet extracted\n"); continue
 
-        if not os.path.exists(exam_output):
-            print(f"    ⚠️  Exam output not found: {exam_output}")
-            print(f"    💡 Run this script first without the memo to extract the exam.\n")
-            continue
+        print(f"    🔗 → {matched_exam}  ({score:.0%} match)")
 
-        print(f"    🔗 Matched  : {matched_exam}")
-        print(f"    🤝 Shared   : {sorted(shared_kw)}  ({score:.0%} match)")
-
-        # ── Extract memo answers ──────────────────────────
         memo_chunks = load_chunks(memo_file)
-        if not memo_chunks:
-            print(f"    ⚠️  Memo empty or invalid — skipping.\n")
-            continue
+        if not memo_chunks: print("    ⚠️  Memo empty\n"); continue
+
+        full_memo = stitch_chunks(memo_chunks)
+        memo_wins = list(sliding_windows(full_memo))
+        print(f"    🔗 {len(memo_chunks)} chunks → {len(memo_wins)} windows")
 
         all_memo_answers = {}
-        for i, chunk in enumerate(memo_chunks):
-            text = chunk.get("content", "").strip()
-            if not text:
-                continue
-            print(f"    🔍 Memo chunk {i + 1}/{len(memo_chunks)}...")
-            answers = extract_memo_answers(text)
-            all_memo_answers.update(answers)
+        for i, window in enumerate(memo_wins):
+            print(f"    🔍 Memo window {i+1}/{len(memo_wins)}...")
+            answers = extract_memo_answers(window)
+            for k, v in answers.items():
+                if k not in all_memo_answers:  # first window wins
+                    all_memo_answers[k] = v
             time.sleep(1.5)
 
-        if not all_memo_answers:
-            print(f"    ⚠️  No answers extracted from memo — skipping.\n")
-            continue
-
+        if not all_memo_answers: print("    ⚠️  No answers\n"); continue
         print(f"    ✅ {len(all_memo_answers)} answers extracted")
 
-        # ── Load exam, inject, save ───────────────────────
-        with open(exam_output) as f:
-            exam_data = json.load(f)
+        sec_a = {k:v for k,v in all_memo_answers.items() if re.match(r"^[123]\.", k)}
+        print(f"    🔎 Section A: {sec_a}")
 
-        updated_exam, matched_count, unmatched = inject_memo_answers(exam_data, all_memo_answers)
+        with open(exam_output) as f: exam_data = json.load(f)
+        updated, matched_count, unmatched = inject_memo_answers(exam_data, all_memo_answers)
+        validate_memo_injection(updated, all_memo_answers)
 
-        updated_exam["memo_merged"]        = True
-        updated_exam["memo_source"]        = memo_file
-        updated_exam["memo_answers_total"] = len(all_memo_answers)
-        updated_exam["memo_matched"]       = matched_count
-        updated_exam["memo_unmatched"]     = unmatched
+        updated["memo_merged"]        = True
+        updated["memo_source"]        = memo_file
+        updated["memo_answers_total"] = len(all_memo_answers)
+        updated["memo_matched"]       = matched_count
+        updated["memo_unmatched"]     = unmatched
 
-        with open(exam_output, "w") as f:
-            json.dump(updated_exam, f, indent=2)
-
-        print(f"    💾 Updated  : {exam_output}")
-        print(f"    📊 Merged   : {matched_count} answers into exam")
-        if unmatched:
-            print(f"    ⚠️  Unmatched: {len(unmatched)} — {unmatched[:10]}"
-                  f"{'...' if len(unmatched) > 10 else ''}")
+        with open(exam_output, "w") as f: json.dump(updated, f, indent=2)
+        print(f"\n    💾 {exam_output}  |  merged {matched_count}/{len(all_memo_answers)}")
+        if unmatched: print(f"    ⚠️  Unmatched: {unmatched[:15]}{'...' if len(unmatched)>15 else ''}")
         print()
 
-        if memo_file not in tracker:
-            tracker[memo_file] = {}
-        tracker[memo_file]["memo_merged"] = True
-        tracker[memo_file]["memo_source"] = matched_exam
-        save_tracker(tracker)
-
-        # Also mark on the exam entry
-        if matched_exam not in tracker:
-            tracker[matched_exam] = {}
-        tracker[matched_exam]["memo_merged"] = True
-        tracker[matched_exam]["memo_source"] = memo_file
+        tracker_set(tracker, memo_file,    "memo_merged", True)
+        tracker_set(tracker, memo_file,    "memo_source", matched_exam)
+        tracker_set(tracker, matched_exam, "memo_merged", True)
+        tracker_set(tracker, matched_exam, "memo_source", memo_file)
         save_tracker(tracker)
 
     print("✅ All done.")
 
-
-# =========================
-# ▶️ RUN
-# =========================
 if __name__ == "__main__":
     process()

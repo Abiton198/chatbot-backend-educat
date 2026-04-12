@@ -1,26 +1,22 @@
 {
-  "May_Theory_2025 .json": {
-    "exam_done": false,
-    "memo_merged": false
-  },
-  "Nov_Theory_2024.json": {
-    "exam_done": false,
-    "memo_merged": false
-  },
-  "Nov_memo_2024.json": {
-    "exam_done": false,
-    "memo_merged": false
-  },
-  "may_Theory_2025 .json": {
+  "may_theory_2025.json": {
     "exam_done": true,
-    "memo_merged": false
-  },
-  "may_theory_2025 .json": {
-    "exam_done": true,
-    "memo_merged": false
+    "memo_merged": true,
+    "memo_source": "may-memo_ 2025.json"
   },
   "nov_theory_2024.json": {
     "exam_done": true,
-    "memo_merged": false
+    "memo_merged": true,
+    "memo_source": "nov_memo_2024.json"
+  },
+  "nov_memo_2024.json": {
+    "exam_done": false,
+    "memo_merged": true,
+    "memo_source": "nov_theory_2024.json"
+  },
+  "may-memo_ 2025.json": {
+    "exam_done": false,
+    "memo_merged": true,
+    "memo_source": "may_theory_2025 .json"
   }
 }

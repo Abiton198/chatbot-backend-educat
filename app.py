@@ -128,7 +128,7 @@ def extract_mcq_from_text(question_text):
 # =========================
 @app.route("/")
 def home():
-    return """
+    return r"""
 <!DOCTYPE html>
 <html>
 <head>
@@ -155,6 +155,7 @@ def home():
         .q-row .q-mark { white-space: nowrap; font-weight: bold; color: #e74c3c; }
         .option-label { display: block; margin: 8px 0; padding: 9px 14px; border: 1px solid #ddd; border-radius: 6px; cursor: pointer; }
         .option-label:hover { background: #f0f4ff; }
+        .option-label input { margin-right: 8px; }
         .tf-label { display: inline-block; margin-right: 20px; padding: 9px 18px; border: 1px solid #ddd; border-radius: 6px; cursor: pointer; }
         .tf-label:hover { background: #f0f4ff; }
         .match-table { width: 100%; border-collapse: collapse; margin-top: 10px; }
@@ -197,11 +198,14 @@ def home():
 <div id="resultsBox" class="box hidden"></div>
 
 <script>
+// ─── State ────────────────────────────────────────────────
 let mode       = null;
 let session_id = null;
-let index      = 0;
+let currentIdx = 0;   // renamed from 'index' to avoid JS reserved-word confusion
 let total      = 0;
+let currentType = null;  // track current question type for saveAnswer()
 
+// ─── Mode switch ──────────────────────────────────────────
 function setMode(m) {
     mode = m;
     document.getElementById("tutorBox").classList.add("hidden");
@@ -210,6 +214,7 @@ function setMode(m) {
     else               document.getElementById("examBox").classList.remove("hidden");
 }
 
+// ─── AI Tutor ─────────────────────────────────────────────
 async function askTutor() {
     const q = document.getElementById("tutorInput").value.trim();
     if (!q) return;
@@ -219,6 +224,7 @@ async function askTutor() {
     document.getElementById("tutorInput").value = "";
 }
 
+// ─── Load exam list ───────────────────────────────────────
 async function loadExams() {
     const res  = await fetch("/exams");
     const data = await res.json();
@@ -232,6 +238,7 @@ async function loadExams() {
     });
 }
 
+// ─── Start exam ───────────────────────────────────────────
 async function startExam() {
     const exam = document.getElementById("examSelect").value;
     if (!exam) { alert("Select an exam first."); return; }
@@ -240,9 +247,8 @@ async function startExam() {
     if (data.error) { alert("Error: " + data.error); return; }
     session_id = data.session_id;
     total      = data.total_questions;
-    index      = 0;
+    currentIdx = 0;
 
-    // Show memo status
     const memoEl = document.getElementById("memoStatus");
     memoEl.innerHTML = data.memo_merged
         ? "✅ Memo loaded — AI marking enabled"
@@ -253,14 +259,22 @@ async function startExam() {
     loadQuestion();
 }
 
+// ─── Load & render question ───────────────────────────────
 async function loadQuestion() {
-    const res = await fetch("/question", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({ session_id, index }) });
-    const q   = await res.json();
+    const res = await fetch("/question", {
+        method: "POST",
+        headers: {"Content-Type":"application/json"},
+        body: JSON.stringify({ session_id, index: currentIdx })
+    });
+    const q = await res.json();
 
     if (q.error) {
         document.getElementById("examArea").innerHTML = `<p style="color:red">⚠️ ${q.error}</p>`;
         return;
     }
+
+    // Store type so saveAnswer knows what to collect
+    currentType = q.type;
 
     let html = "";
 
@@ -282,113 +296,182 @@ async function loadQuestion() {
             <span class="q-mark">(${q.marks})</span>
         </div>`;
 
-    // MCQ
+    // ── MCQ ──────────────────────────────────────────────
     if (q.type === "mcq" && Array.isArray(q.options) && q.options.length > 0) {
-        html += `<div style="margin-top:14px;">`;
+        html += `<div id="mcqOptions" style="margin-top:14px;">`;
         q.options.forEach(opt => {
             const chk = q.saved_answer === opt.key ? "checked" : "";
-            html += `<label class="option-label"><input type="radio" name="mcq" value="${opt.key}" ${chk}> <b>${opt.key}.</b>&nbsp; ${opt.value}</label>`;
+            html += `
+                <label class="option-label">
+                    <input type="radio" name="mcq_answer" value="${opt.key}" ${chk}>
+                    <b>${opt.key}.</b>&nbsp;${opt.value}
+                </label>`;
         });
         html += `</div>`;
     }
-    // True/False
+
+    // ── True/False ────────────────────────────────────────
     else if (q.type === "true_false") {
-        const savedTF = q.saved_answer || "";
+        const savedTF     = q.saved_answer || "";
+        const isFalse     = savedTF.startsWith("False");
+        const correction  = isFalse && savedTF.includes("—") ? savedTF.split("—").slice(1).join("—").trim() : "";
         html += `
-            <div style="margin-top:14px;">
-                <label class="tf-label"><input type="radio" name="tf" value="True"  ${savedTF==="True"?"checked":""}> ✅ True</label>
-                <label class="tf-label"><input type="radio" name="tf" value="False" ${savedTF==="False"||savedTF.startsWith("False")?"checked":""}> ❌ False</label>
-                <div id="tfCorrection" style="margin-top:12px;${savedTF.startsWith("False")?"":"display:none"}">
-                    <label style="font-size:13px;color:#555;">If FALSE — write the corrected word/phrase:</label>
-                    <input type="text" id="tfCorrectionBox" placeholder="e.g. secondary memory"
-                        value="${savedTF.startsWith("False — ") ? savedTF.replace("False — ","") : ""}">
-                </div>
+            <div id="tfOptions" style="margin-top:14px;">
+                <label class="tf-label">
+                    <input type="radio" name="tf_answer" value="True" ${savedTF === "True" ? "checked" : ""}>
+                    ✅ True
+                </label>
+                <label class="tf-label">
+                    <input type="radio" name="tf_answer" value="False" ${isFalse ? "checked" : ""}>
+                    ❌ False
+                </label>
             </div>
-            <script>
-                document.querySelectorAll('input[name="tf"]').forEach(r => {
-                    r.addEventListener("change", () => {
-                        document.getElementById("tfCorrection").style.display = r.value==="False"&&r.checked ? "block" : r.value==="True"&&r.checked ? "none" : "";
-                    });
-                });
-            <\\/script>`;
+            <div id="tfCorrection" style="margin-top:12px; ${isFalse ? "" : "display:none"}">
+                <label style="font-size:13px; color:#555;">
+                    If FALSE — write the corrected word/phrase:
+                </label>
+                <input type="text" id="tfCorrectionBox"
+                    placeholder="e.g. secondary memory"
+                    value="${correction}">
+            </div>`;
     }
-    // Matching
+
+    // ── Matching ──────────────────────────────────────────
     else if (q.type === "matching" && Array.isArray(q.column_a) && q.column_a.length > 0) {
         let saved = {};
-        try { saved = JSON.parse(q.saved_answer || "{}"); } catch(e) {}
+        try { saved = typeof q.saved_answer === "string" && q.saved_answer ? JSON.parse(q.saved_answer) : {}; } catch(e) {}
         html += `
-            <p style="margin-top:12px;font-size:13px;color:#555;"><i>Match each item in COLUMN A to the correct answer in COLUMN B.</i></p>
-            <table class="match-table">
-                <thead><tr><th style="width:45%">COLUMN A</th><th>COLUMN B — Your Match</th></tr></thead>
+            <p style="margin-top:12px; font-size:13px; color:#555;">
+                <i>Match each item in COLUMN A to the correct answer in COLUMN B.</i>
+            </p>
+            <table class="match-table" id="matchTable">
+                <thead><tr><th style="width:55%">COLUMN A</th><th>COLUMN B — Your Match</th></tr></thead>
                 <tbody>`;
         q.column_a.forEach((item, i) => {
             const savedVal = saved[item] || "";
-            html += `<tr><td>${item}</td><td><select name="match_${i}" data-item="${encodeURIComponent(item)}">
-                <option value="">-- Select --</option>`;
+            html += `
+                <tr>
+                    <td>${item}</td>
+                    <td>
+                        <select class="match-select" data-item="${encodeURIComponent(item)}">
+                            <option value="">-- Select --</option>`;
             q.column_b.forEach(b => {
-                html += `<option value="${b}" ${savedVal===b?"selected":""}>${b}</option>`;
+                html += `<option value="${b}" ${savedVal === b ? "selected" : ""}>${b}</option>`;
             });
-            html += `</select></td></tr>`;
+            html += `       </select>
+                    </td>
+                </tr>`;
         });
-        html += `</tbody></table>`;
-    }
-    // Open
-    else {
-        html += `<textarea id="answerBox" placeholder="Write your answer here..." style="margin-top:14px;">${q.saved_answer || ""}</textarea>`;
+        html += `   </tbody>
+            </table>`;
     }
 
-    // Nav
+    // ── Open ──────────────────────────────────────────────
+    else {
+        html += `
+            <textarea id="openAnswerBox"
+                placeholder="Write your answer here..."
+                style="margin-top:14px;">${q.saved_answer || ""}</textarea>`;
+    }
+
+    // Nav bar
     html += `
         <div class="nav-bar">
-            <button onclick="saveAnswer()">💾 Save</button>
-            <button onclick="prevQ()" ${index===0?"disabled":""}>⬅ Back</button>
-            <button onclick="nextQ()" ${index>=total-1?"disabled":""}>Next ➡</button>
+            <button onclick="saveAndNext(-1)">⬅ Back</button>
+            <button onclick="saveOnly()">💾 Save</button>
+            <button onclick="saveAndNext(1)">Next ➡</button>
             <button class="submit-btn" onclick="submitExam()">✅ Submit Exam</button>
         </div>
-        <p class="progress">Question ${index+1} of ${total}</p>`;
+        <p class="progress">Question ${currentIdx + 1} of ${total}</p>`;
 
     document.getElementById("examArea").innerHTML = html;
+
+    // Attach True/False toggle listener after render
+    document.querySelectorAll('input[name="tf_answer"]').forEach(r => {
+        r.addEventListener("change", () => {
+            const corrBox = document.getElementById("tfCorrection");
+            if (corrBox) {
+                corrBox.style.display = (r.value === "False" && r.checked) ? "block" : "none";
+            }
+        });
+    });
 }
 
-async function saveAnswer() {
-    let answer = "";
-    const mcqSel = document.querySelector('input[name="mcq"]:checked');
-    if (mcqSel) answer = mcqSel.value;
+// ─── Collect current answer (type-aware, no cross-contamination) ──
+function collectAnswer() {
+    // MCQ — only look for mcq radio buttons
+    if (currentType === "mcq") {
+        const sel = document.querySelector('input[name="mcq_answer"]:checked');
+        return sel ? sel.value : "";
+    }
 
-    const tfSel = document.querySelector('input[name="tf"]:checked');
-    if (tfSel) {
-        if (tfSel.value === "False") {
+    // True/False
+    if (currentType === "true_false") {
+        const sel = document.querySelector('input[name="tf_answer"]:checked');
+        if (!sel) return "";
+        if (sel.value === "False") {
             const corr = (document.getElementById("tfCorrectionBox")?.value || "").trim();
-            answer = corr ? `False — ${corr}` : "False";
-        } else {
-            answer = "True";
+            return corr ? `False — ${corr}` : "False";
         }
+        return "True";
     }
 
-    const matchSels = document.querySelectorAll('select[name^="match_"]');
-    if (matchSels.length > 0) {
+    // Matching
+    if (currentType === "matching") {
         const obj = {};
-        matchSels.forEach(s => { if (s.value) obj[decodeURIComponent(s.dataset.item)] = s.value; });
-        answer = JSON.stringify(obj);
+        document.querySelectorAll(".match-select").forEach(s => {
+            if (s.value) obj[decodeURIComponent(s.dataset.item)] = s.value;
+        });
+        return Object.keys(obj).length > 0 ? JSON.stringify(obj) : "";
     }
 
-    const textBox = document.getElementById("answerBox");
-    if (textBox) answer = textBox.value;
+    // Open
+    const textBox = document.getElementById("openAnswerBox");
+    return textBox ? textBox.value.trim() : "";
+}
 
-    const res  = await fetch("/answer", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({ session_id, index, answer }) });
-    const data = await res.json();
+// ─── Save answer to server ────────────────────────────────
+async function saveCurrentAnswer() {
+    const answer = collectAnswer();
+    const res = await fetch("/answer", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({ session_id, index: currentIdx, answer })
+    });
+    return await res.json();
+}
+
+// ─── Save only (no navigation) ────────────────────────────
+async function saveOnly() {
+    const data = await saveCurrentAnswer();
     if (data.status === "saved") {
-        const btn = document.querySelector("button[onclick='saveAnswer()']");
+        const btn = document.querySelector("button[onclick='saveOnly()']");
         if (btn) { btn.textContent = "✅ Saved!"; setTimeout(() => btn.textContent = "💾 Save", 1500); }
     }
 }
 
-function nextQ() { if (index < total-1) { index++; loadQuestion(); } }
-function prevQ() { if (index > 0)       { index--; loadQuestion(); } }
+// ─── Save then navigate ───────────────────────────────────
+async function saveAndNext(direction) {
+    await saveCurrentAnswer();
+    const next = currentIdx + direction;
+    if (next >= 0 && next < total) {
+        currentIdx = next;
+        loadQuestion();
+    }
+}
 
+// ─── Submit exam ──────────────────────────────────────────
 async function submitExam() {
+    // Save current answer first
+    await saveCurrentAnswer();
+
     if (!confirm("Submit exam? You cannot change answers after this.")) return;
-    const res  = await fetch("/submit", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({session_id}) });
+
+    const res  = await fetch("/submit", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({ session_id })
+    });
     const data = await res.json();
     if (data.error) { alert("Error: " + data.error); return; }
 
@@ -401,13 +484,31 @@ async function submitExam() {
     }
 
     data.results.forEach(r => {
-        const bg   = r.status==="correct" ? "#d4edda" : r.status==="partial" ? "#fff3cd" : "#f8d7da";
-        const icon = r.status==="correct" ? "✅" : r.status==="partial" ? "⚠️" : "❌";
+        const bg   = r.status === "correct" ? "#d4edda"
+                   : r.status === "partial"  ? "#fff3cd"
+                   :                           "#f8d7da";
+        const icon = r.status === "correct" ? "✅"
+                   : r.status === "partial"  ? "⚠️"
+                   :                           "❌";
+
+        // Format correct answer for display
+        let correctDisplay = r.correct_answer || "<i>Not available</i>";
+
+        // Format student answer for display  
+        let studentDisplay = r.student_answer || "<i>No answer</i>";
+        // If matching, pretty-print the JSON
+        if (r.type === "matching" && r.student_answer) {
+            try {
+                const obj = JSON.parse(r.student_answer);
+                studentDisplay = Object.entries(obj).map(([k,v]) => `${k} → ${v}`).join("<br>");
+            } catch(e) {}
+        }
+
         html += `
             <div class="result-card" style="background:${bg};">
                 <b>${icon} ${r.question_number} [${r.marks}]:</b> ${r.question}<br>
-                <b>Your Answer:</b> ${r.student_answer || "<i>No answer</i>"}<br>
-                <b>Correct Answer:</b> ${r.correct_answer || "<i>Not available</i>"}<br>
+                <b>Your Answer:</b> ${studentDisplay}<br>
+                <b>Correct Answer:</b> ${correctDisplay}<br>
                 <b>AI Feedback:</b> ${r.feedback || "—"}<br>
                 <b>Status:</b> ${r.status} &nbsp;|&nbsp; <b>Earned:</b> ${r.earned}/${r.marks}
             </div>`;
@@ -479,18 +580,19 @@ def get_question():
     try:
         data    = request.get_json()
         sid     = data.get("session_id")
-        index   = data.get("index", 0)
+        idx     = data.get("index", 0)
         session = sessions.get(sid)
 
         if not session:
             return jsonify({"error": "Invalid session"})
 
         flat = session["questions"]
-        if index < 0 or index >= len(flat):
+        if idx < 0 or idx >= len(flat):
             return jsonify({"error": "Question index out of range"})
 
-        q = flat[index].copy()
-        q["saved_answer"] = session["answers"].get(str(index), "")
+        q = flat[idx].copy()
+        # Restore saved answer keyed by index string
+        q["saved_answer"] = session["answers"].get(str(idx), "")
         return jsonify(q)
 
     except Exception as e:
@@ -500,21 +602,22 @@ def get_question():
 
 # =========================
 # 💾 SAVE ANSWER
+# Keyed by str(index) in session["answers"]
 # =========================
 @app.route("/answer", methods=["POST"])
 def save_answer():
     try:
         data    = request.get_json()
         sid     = data.get("session_id")
-        index   = data.get("index")
+        idx     = data.get("index")
         answer  = data.get("answer", "")
         session = sessions.get(sid)
 
         if not session:
             return jsonify({"error": "Invalid session"})
 
-        session["answers"][str(index)] = answer
-        return jsonify({"status": "saved"})
+        session["answers"][str(idx)] = answer
+        return jsonify({"status": "saved", "index": idx, "length": len(str(answer))})
 
     except Exception as e:
         return jsonify({"error": str(e)})
@@ -522,8 +625,8 @@ def save_answer():
 
 # =========================
 # 📝 SUBMIT + AI MARK
-# Uses mark_exam_batch from model.py
-# which feeds on memo from the exam JSON file
+# Passes question_number alongside each question so model.py
+# can use it as the memo lookup key rather than array position.
 # =========================
 @app.route("/submit", methods=["POST"])
 def submit_exam():
@@ -539,14 +642,19 @@ def submit_exam():
         flat      = session["questions"]
         answers   = session["answers"]
 
-        # ── AI marks all answers using memo from exam JSON ──
-        marked = mark_exam_batch(exam_name, flat, answers)
+        # Build per-question answer list with question_number attached
+        # so model.py never has to guess by index
+        questions_with_answers = []
+        for i, q in enumerate(flat):
+            qcopy = dict(q)
+            qcopy["student_answer"] = answers.get(str(i), "")
+            questions_with_answers.append(qcopy)
 
-        # Add earned field (same as score per question)
+        marked = mark_exam_batch(exam_name, questions_with_answers, answers)
+
         for r in marked["results"]:
             r["earned"] = r.get("score", 0)
 
-        # ── AI generates overall feedback ──────────────────
         feedback = generate_exam_feedback(
             results    = marked["results"],
             score      = marked["total_score"],
@@ -570,7 +678,6 @@ def submit_exam():
 
 # =========================
 # 🧠 AI TUTOR
-# Feeds on RAG context from theory books only
 # =========================
 @app.route("/chat", methods=["POST"])
 def chat():

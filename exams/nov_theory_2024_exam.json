@@ -7,8 +7,8 @@
     "true_false": 6,
     "open": 31
   },
-  "memo_merged": false,
-  "memo_source": null,
+  "memo_merged": true,
+  "memo_source": "nov_memo_2024.json",
   "sections": [
     {
       "section": "A",
@@ -30,7 +30,7 @@
             "D": "Mouse"
           },
           "marks": 1,
-          "memo": ""
+          "memo": "Kickstarter"
         },
         {
           "id": 2,
@@ -46,7 +46,7 @@
             "D": "increasing the use of online and"
           },
           "marks": 1,
-          "memo": ""
+          "memo": "Indiegogo"
         },
         {
           "id": 3,
@@ -69,7 +69,7 @@
           "type": "true_false",
           "options": null,
           "marks": 1,
-          "memo": ""
+          "memo": "True"
         },
         {
           "id": 5,
@@ -85,7 +85,7 @@
             "D": "Power user"
           },
           "marks": 1,
-          "memo": ""
+          "memo": "Kickstarter"
         },
         {
           "id": 6,
@@ -101,7 +101,7 @@
             "D": "Add-on/Plug-in"
           },
           "marks": 1,
-          "memo": ""
+          "memo": "Indiegogo"
         },
         {
           "id": 7,
@@ -117,7 +117,7 @@
             "D": "Extraction"
           },
           "marks": 1,
-          "memo": ""
+          "memo": "GoFundMe"
         },
         {
           "id": 8,
@@ -133,7 +133,7 @@
             "D": "indicate new sources of information."
           },
           "marks": 1,
-          "memo": ""
+          "memo": "seedInvest"
         },
         {
           "id": 9,
@@ -149,7 +149,7 @@
             "D": "To simplify hardware setup"
           },
           "marks": 1,
-          "memo": ""
+          "memo": "Kiva"
         },
         {
           "id": 10,
@@ -165,7 +165,7 @@
             "D": "Web browser"
           },
           "marks": 1,
-          "memo": ""
+          "memo": "Patreon"
         },
         {
           "id": 11,
@@ -181,7 +181,7 @@
             "D": "Drop Cap"
           },
           "marks": 1,
-          "memo": ""
+          "memo": "CrowdQueb"
         },
         {
           "id": 12,
@@ -197,7 +197,7 @@
             "D": "Inkjet printers"
           },
           "marks": 1,
-          "memo": ""
+          "memo": "Back a Buddy"
         },
         {
           "id": 13,
@@ -208,7 +208,7 @@
           "type": "true_false",
           "options": null,
           "marks": 1,
-          "memo": ""
+          "memo": "True"
         },
         {
           "id": 14,
@@ -224,7 +224,7 @@
             "D": "text"
           },
           "marks": 1,
-          "memo": ""
+          "memo": "Kickstarter"
         },
         {
           "id": 15,
@@ -235,7 +235,7 @@
           "type": "true_false",
           "options": null,
           "marks": 1,
-          "memo": ""
+          "memo": "False \u2014 Braille"
         },
         {
           "id": 16,
@@ -251,7 +251,7 @@
             "D": "text"
           },
           "marks": 1,
-          "memo": ""
+          "memo": "Kickstarter"
         },
         {
           "id": 17,
@@ -262,7 +262,7 @@
           "type": "true_false",
           "options": null,
           "marks": 1,
-          "memo": ""
+          "memo": "False \u2014 Secondary"
         },
         {
           "id": 18,
@@ -273,7 +273,7 @@
           "type": "true_false",
           "options": null,
           "marks": 1,
-          "memo": ""
+          "memo": "True"
         },
         {
           "id": 19,
@@ -284,7 +284,7 @@
           "type": "true_false",
           "options": null,
           "marks": 1,
-          "memo": ""
+          "memo": "False \u2014 Focus"
         },
         {
           "id": 20,
@@ -300,7 +300,7 @@
             "D": "text"
           },
           "marks": 1,
-          "memo": ""
+          "memo": "Kickstarter"
         }
       ]
     },
@@ -319,7 +319,7 @@
           "type": "open",
           "options": null,
           "marks": 1,
-          "memo": ""
+          "memo": "Can easily be lost/stolen / Batteries should be replaced often / Prone to signal interference/disturbance / Bluetooth receiver can be lost/damaged then mouse won't work/device out of range of receiver"
         },
         {
           "id": 22,
@@ -330,7 +330,7 @@
           "type": "open",
           "options": null,
           "marks": 2,
-          "memo": ""
+          "memo": "A single-user system is limited to only one active user / one user at a time / Multi-user system allows more than one user at the same time"
         },
         {
           "id": 23,
@@ -341,7 +341,7 @@
           "type": "open",
           "options": null,
           "marks": 2,
-          "memo": ""
+          "memo": "Can easily be lost/stolen / Batteries should be replaced often / Prone to signal interference/disturbance / Bluetooth receiver can be lost/damaged then mouse won't work/device out of range of receiver"
         },
         {
           "id": 24,
@@ -352,7 +352,7 @@
           "type": "open",
           "options": null,
           "marks": 2,
-          "memo": ""
+          "memo": "Biometric security and ONE example of a biometric device: Fingerprint reader/scanner / Iris/Eye/Retinal scanner / Facial recognition camera / Voice recognition microphone"
         },
         {
           "id": 25,
@@ -363,7 +363,7 @@
           "type": "open",
           "options": null,
           "marks": 2,
-          "memo": ""
+          "memo": "Purpose of a UPS compared to a permanent power supply: A power supply is"
         },
         {
           "id": 26,
@@ -374,7 +374,7 @@
           "type": "open",
           "options": null,
           "marks": 3,
-          "memo": ""
+          "memo": "Processor (CPU) / Memory (RAM) / Storage (SSD/HDD)"
         },
         {
           "id": 27,
@@ -385,7 +385,7 @@
           "type": "open",
           "options": null,
           "marks": 2,
-          "memo": ""
+          "memo": "Cable/signal (WiFi; Bluetooth, etc.) not connected properly / Faulty cable/port"
         },
         {
           "id": 28,
@@ -396,7 +396,7 @@
           "type": "open",
           "options": null,
           "marks": 2,
-          "memo": ""
+          "memo": "Captions/subtitles for spoken dialog / Visual (flashing) notifications for sounds"
         },
         {
           "id": 29,
@@ -407,7 +407,7 @@
           "type": "open",
           "options": null,
           "marks": 1,
-          "memo": ""
+          "memo": "Online gaming"
         },
         {
           "id": 30,
@@ -418,7 +418,7 @@
           "type": "open",
           "options": null,
           "marks": 2,
-          "memo": ""
+          "memo": "Adjust screen resolution / Adjust display settings"
         },
         {
           "id": 31,
@@ -429,7 +429,7 @@
           "type": "open",
           "options": null,
           "marks": 1,
-          "memo": ""
+          "memo": "Install a patch / Install a service pack / Update software"
         },
         {
           "id": 32,
@@ -440,7 +440,7 @@
           "type": "open",
           "options": null,
           "marks": 2,
-          "memo": ""
+          "memo": "Security vulnerabilities: create security loopholes that attackers might use to gain unauthorised access / Data loss or corruption: data can be lost or corrupted / System crashing: the device can malfunction or crash, causing a disruption in normal operation / Compatibility issues: can cause compatibility problems with hardware and software"
         },
         {
           "id": 33,
@@ -451,7 +451,7 @@
           "type": "open",
           "options": null,
           "marks": 2,
-          "memo": ""
+          "memo": "Hidden: The user cannot see the file / Hidden: Hides the file from view and layout / Hidden: Not visible to a user if show/hide is not enabled / Read-only: The user can see the file, but cannot change the file / Read-only: Prevents user from editing the file but can still be opened / Read-only: Immediately visible to user / Read-only: Can be viewed and copied, but not edited or deleted without changing the attribute"
         },
         {
           "id": 34,
@@ -462,7 +462,7 @@
           "type": "open",
           "options": null,
           "marks": 1,
-          "memo": ""
+          "memo": "Fibre optic cable"
         },
         {
           "id": 35,
@@ -473,7 +473,7 @@
           "type": "open",
           "options": null,
           "marks": 2,
-          "memo": ""
+          "memo": "A device that allows other wireless devices to connect to a wired/wireless network"
         },
         {
           "id": 36,
@@ -484,7 +484,7 @@
           "type": "open",
           "options": null,
           "marks": 1,
-          "memo": ""
+          "memo": "Firewalls / VPN / Access controls/Authentication/Logins (Username and Password) / Antivirus or anti-malware security / Use security protocols for password encryption / Network data/files can be encrypted"
         },
         {
           "id": 37,
@@ -495,7 +495,7 @@
           "type": "open",
           "options": null,
           "marks": 2,
-          "memo": ""
+          "memo": "Company too small to justify cost of Intranet/Often tied to licencing / Staff can bring in unauthorised devices and infect the intranet with malware / Requires integration and maintenance / Often overly complex for employees/ Inaccessible/challenging to access for employees working from home/personal PCs or smartphones/Rarely equipped with offline functionality/Employees need to be trained"
         },
         {
           "id": 38,
@@ -506,7 +506,7 @@
           "type": "open",
           "options": null,
           "marks": 2,
-          "memo": ""
+          "memo": "Integration of technologies in the physical, digital, biological world"
         },
         {
           "id": 39,
@@ -517,7 +517,7 @@
           "type": "open",
           "options": null,
           "marks": 2,
-          "memo": ""
+          "memo": "Efficient use of screen space / Faster navigation/Saves time to access websites / Access to more than one website / Organise tabs in groups / Allows multiple home pages that all open simultaneously / Convenient for multitasking"
         },
         {
           "id": 40,
@@ -528,7 +528,7 @@
           "type": "open",
           "options": null,
           "marks": 2,
-          "memo": ""
+          "memo": "File size/Multiple files open / Bandwidth size / Background applications running / The type of internet connection / The quality/stability/reliability of the connection/network traffic/congestion / Distance from the"
         },
         {
           "id": 41,
@@ -539,7 +539,7 @@
           "type": "open",
           "options": null,
           "marks": 1,
-          "memo": ""
+          "memo": "The subject line does not indicate the topic of the e-mail"
         },
         {
           "id": 42,
@@ -550,7 +550,7 @@
           "type": "open",
           "options": null,
           "marks": 2,
-          "memo": ""
+          "memo": "High priority: These emails are marked as important by the sender/should be addressed promptly / Flagging: Flagging is a way for you to organise/categorise/ prioritise/follow up or keep track of e-mails"
         },
         {
           "id": 43,
@@ -561,7 +561,7 @@
           "type": "open",
           "options": null,
           "marks": 2,
-          "memo": ""
+          "memo": "Write a report / Create a presentation"
         },
         {
           "id": 44,
@@ -572,7 +572,7 @@
           "type": "open",
           "options": null,
           "marks": 1,
-          "memo": ""
+          "memo": "Factual information that won\u2019t change"
         },
         {
           "id": 45,
@@ -583,7 +583,7 @@
           "type": "open",
           "options": null,
           "marks": 2,
-          "memo": ""
+          "memo": "Use mostly closed questions / Keep questions short"
         },
         {
           "id": 46,
@@ -594,7 +594,7 @@
           "type": "open",
           "options": null,
           "marks": 1,
-          "memo": ""
+          "memo": "Perform (complex) queries"
         },
         {
           "id": 47,
@@ -605,7 +605,7 @@
           "type": "open",
           "options": null,
           "marks": 1,
-          "memo": ""
+          "memo": "Bibliography / Endnote/Footnote / Caption"
         },
         {
           "id": 48,
@@ -616,7 +616,7 @@
           "type": "open",
           "options": null,
           "marks": 1,
-          "memo": ""
+          "memo": "Include the image creator/author/photographer/artist name / Name of image / Website/Hyperlink (URL) to the original source / Date of creation, publisher"
         },
         {
           "id": 49,
@@ -627,7 +627,7 @@
           "type": "open",
           "options": null,
           "marks": 0,
-          "memo": ""
+          "memo": "The average age for participants of the bike race is 32 / The number of participants for the bike race is 5 / 3 of the participants for the bike race are older than 30 years / 2 participants for the bike race are 30 years and younger / More participants in their 30\u2019s choose to bike / More runners than bikers"
         }
       ]
     },
@@ -646,7 +646,7 @@
           "type": "open",
           "options": null,
           "marks": 1,
-          "memo": ""
+          "memo": "Eliminate background noises / Equipment must be set up correctly / Make sure that the interview is recorded / Make sure there is good lighting / Speak clearly/Audible"
         },
         {
           "id": 51,
@@ -657,9 +657,14 @@
           "type": "open",
           "options": null,
           "marks": 5,
-          "memo": ""
+          "memo": "Eliminate background noises / Equipment must be set up correctly / Make sure that the interview is recorded / Make sure there is good lighting / Speak clearly/Audible"
         }
       ]
     }
+  ],
+  "memo_answers_total": 102,
+  "memo_matched": 50,
+  "memo_unmatched": [
+    "2"
   ]
 }

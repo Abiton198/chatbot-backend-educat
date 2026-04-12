@@ -1,347 +1,261 @@
 import os
 import json
+import re
+import time
 from groq import Groq
 from dotenv import load_dotenv
 
-# =========================
-# 🔑 LOAD ENV
-# =========================
 load_dotenv()
 API_KEY = os.getenv("GROQ_API_KEY")
 if not API_KEY:
-    raise ValueError("❌ GROQ_API_KEY not set in environment")
+    raise ValueError("❌ GROQ_API_KEY not set")
 
 client = Groq(api_key=API_KEY)
-
-# Model used across all functions
-MODEL = "llama-3.3-70b-versatile"
-
-# Exams folder — for loading memo answers directly from exam JSON
-BASE_DIR     = os.path.dirname(__file__)
-EXAMS_FOLDER = os.path.join(BASE_DIR, "exams")
+MODEL  = "llama-3.3-70b-versatile"
 
 
 # =========================
-# 📂 LOAD MEMO FROM EXAM FILE
-# Used by exam marking so it reads the merged memo
-# from the processed exam JSON — NOT from the theory book.
-# =========================
-def load_exam_memo(exam_name):
-    """
-    Load all memo answers from an exam JSON file.
-    Returns a flat dict: { "question_number": "memo_answer" }
-    e.g. { "1.1": "C", "4.1": "answer text...", "2.1": "R" }
-    """
-    path = os.path.join(EXAMS_FOLDER, exam_name)
-    if not os.path.exists(path):
-        return {}
-
-    try:
-        with open(path) as f:
-            exam = json.load(f)
-    except Exception:
-        return {}
-
-    memo_map = {}
-
-    for section in exam.get("sections", []):
-        for q in section.get("questions", []):
-            q_num = q.get("question_number", "").strip()
-            memo  = q.get("memo", "")
-
-            if not q_num:
-                continue
-
-            # Matching memo is a dict — convert to readable string
-            if isinstance(memo, dict):
-                memo_map[q_num] = memo  # keep as dict for structured marking
-            elif memo:
-                memo_map[q_num] = str(memo).strip()
-
-    return memo_map
-
-
-# =========================
-# 🎓 AI TUTOR (RAG ANSWER)
-# Feeds on theory/content retrieved by rag.py
+# 🎓 AI TUTOR
 # =========================
 def generate_answer(context, question):
-    """
-    Generates a tutor answer using RAG context from theory books.
-    Called by app.py /chat endpoint.
-    """
     try:
-        prompt = f"""You are a friendly and knowledgeable CAT (Computer Applications Technology) Grade 12 tutor.
+        prompt = f"""You are a friendly CAT Grade 12 tutor.
+Use the context below to answer the student's question.
+If context is insufficient, use your own CAT knowledge.
 
-Use the context below — extracted from the CAT theory book — to answer the student's question.
-If the context does not contain enough information, use your own CAT knowledge to help.
+Context:
+{context.strip() if context and context.strip() else "No specific context — using general CAT knowledge."}
 
-Context (from theory book):
-{context if context.strip() else "No specific context found — using general CAT knowledge."}
+Student Question: {question}
 
-Student Question:
-{question}
+Answer clearly, concisely, with examples where helpful."""
 
-Instructions:
-- Explain clearly in simple, student-friendly language
-- Use examples where helpful
-- Be concise but thorough
-- Always relate answers to CAT Grade 12 content
-- Do NOT refer to exam questions or memo answers
-
-Answer:"""
-
-        response = client.chat.completions.create(
+        r = client.chat.completions.create(
             model=MODEL,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=500,
             temperature=0.3
         )
-
-        answer = response.choices[0].message.content
-        if not answer or not answer.strip():
-            return "⚠️ No response generated. Try rephrasing your question."
-        return answer.strip()
-
+        ans = r.choices[0].message.content
+        return ans.strip() if ans and ans.strip() else "⚠️ No response generated."
     except Exception as e:
-        return f"⚠️ Error generating answer: {str(e)}"
+        return f"⚠️ Error: {e}"
 
 
 # =========================
-# 🧠 AI EXAM MARKER (SINGLE QUESTION)
-# Feeds ONLY on the memo from the exam JSON.
-# For open questions with no memo → gives structured feedback only.
+# 🧠 MARK SINGLE ANSWER
+# memo comes from q["memo"] which was set during extraction.
+# We NEVER load memo by question_number from a separate dict —
+# that caused the Kickstarter-for-1.1 bug.
 # =========================
-def mark_answer(question, question_number, q_type, student_answer, memo, marks):
-    """
-    Marks a single answer using AI.
-    - MCQ and True/False: exact match only, no AI needed
-    - Matching: per-pair scoring, no AI needed
-    - Open: AI compares meaning against memo answer
+def mark_answer(question, question_number, q_type, student_answer, memo, marks, options=None):
+    student = str(student_answer).strip() if student_answer else ""
 
-    Returns: { "score": int, "feedback": str, "status": str }
-    """
-
-    # ── MCQ: no AI needed — exact letter match ────────
+    # ── MCQ ──────────────────────────────────────────────
     if q_type == "mcq":
         correct = str(memo).strip().upper()
-        ans     = str(student_answer).strip().upper()
+        ans     = student.upper()
         if not correct:
-            return {"score": 0, "feedback": "No memo available for this question.", "status": "no_memo"}
+            return {"score": 0, "feedback": "No memo for this question.", "status": "no_memo"}
+        if not ans:
+            return {"score": 0, "feedback": f"No answer selected. Correct: {correct}.", "status": "missing"}
         if ans == correct:
-            return {"score": marks, "feedback": f"Correct! The answer is {correct}.", "status": "correct"}
-        return {"score": 0, "feedback": f"Incorrect. The correct answer is {correct}.", "status": "incorrect"}
+            # Find option text for richer feedback
+            opt_text = ""
+            if options:
+                for opt in options:
+                    if isinstance(opt, dict) and opt.get("key","").upper() == correct:
+                        opt_text = f" ({opt['value']})"
+                        break
+            return {"score": marks, "feedback": f"Correct! Answer: {correct}{opt_text}.", "status": "correct"}
+        return {"score": 0, "feedback": f"Incorrect. You selected {ans}; correct answer is {correct}.", "status": "incorrect"}
 
-    # ── True/False: near-exact match ─────────────────
+    # ── True/False ────────────────────────────────────────
     if q_type == "true_false":
         if not memo:
             return {"score": 0, "feedback": "No memo available.", "status": "no_memo"}
         correct_lower = str(memo).strip().lower()
-        ans_lower     = str(student_answer).strip().lower()
-        if correct_lower == "true" and ans_lower == "true":
-            return {"score": marks, "feedback": "Correct!", "status": "correct"}
-        if correct_lower.startswith("false") and ans_lower.startswith("false"):
-            # Check correction word
-            memo_word = correct_lower.replace("false —", "").replace("false-", "").strip()
-            ans_word  = ans_lower.replace("false —", "").replace("false-", "").strip()
-            if not memo_word or memo_word in ans_word or ans_word in memo_word:
-                return {"score": marks, "feedback": "Correct!", "status": "correct"}
-            return {
-                "score": marks // 2,
-                "feedback": f"Correct that it is FALSE, but the correction should be: '{memo_word}'.",
-                "status": "partial"
-            }
-        return {
-            "score": 0,
-            "feedback": f"Incorrect. The statement is: {memo}",
-            "status": "incorrect"
-        }
+        ans_lower     = student.lower()
+        if not ans_lower:
+            return {"score": 0, "feedback": f"No answer. Correct: {memo}", "status": "missing"}
 
-    # ── Matching: per-pair scoring ────────────────────
+        correct_is_true = correct_lower.startswith("true")
+        student_is_true = ans_lower.startswith("true")
+
+        if correct_is_true and student_is_true:
+            return {"score": marks, "feedback": "Correct — True.", "status": "correct"}
+
+        if not correct_is_true and not student_is_true:
+            # Both False — check correction word
+            def extract_correction(s):
+                parts = re.split(r"[-—]", s, maxsplit=1)
+                return parts[1].strip().lower() if len(parts) > 1 else ""
+            memo_word = extract_correction(correct_lower)
+            stu_word  = extract_correction(ans_lower)
+            if not memo_word or (stu_word and (memo_word in stu_word or stu_word in memo_word)):
+                return {"score": marks, "feedback": f"Correct — False, correction: {stu_word or memo_word}.", "status": "correct"}
+            return {
+                "score":    marks // 2,
+                "feedback": f"Correct it's FALSE, but wrong correction. Expected: '{memo_word}', got: '{stu_word or '(none)'}'.",
+                "status":   "partial"
+            }
+
+        return {"score": 0, "feedback": f"Incorrect. Correct answer: {memo}.", "status": "incorrect"}
+
+    # ── Matching ──────────────────────────────────────────
     if q_type == "matching":
         if not isinstance(memo, dict) or not memo:
-            return {"score": 0, "feedback": "No memo available for matching.", "status": "no_memo"}
+            return {"score": 0, "feedback": "No memo for matching.", "status": "no_memo"}
         try:
-            student_map = json.loads(student_answer) if isinstance(student_answer, str) else student_answer
+            student_map = json.loads(student) if student else {}
         except Exception:
             student_map = {}
-        correct_count = sum(
-            1 for k, v in memo.items()
-            if str(student_map.get(k, "")).strip().lower() == str(v).strip().lower()
-        )
+
+        correct_count = 0
+        details = []
+        for col_a_item, correct_letter in memo.items():
+            student_val    = student_map.get(col_a_item, "")
+            # student_val looks like "R. convergence" — extract letter only
+            student_letter = student_val.strip().split(".")[0].strip().upper() if student_val else ""
+            correct_clean  = str(correct_letter).strip().upper()
+            if student_letter == correct_clean:
+                correct_count += 1
+                details.append(f"✅ {col_a_item.split()[0]}: {student_letter}")
+            else:
+                details.append(f"❌ {col_a_item.split()[0]}: got '{student_letter or '—'}', need '{correct_clean}'")
+
         total_pairs = len(memo)
-        earned      = round((correct_count / total_pairs) * marks) if total_pairs else 0
-        status      = "correct" if earned == marks else ("partial" if earned > 0 else "incorrect")
+        earned = round((correct_count / total_pairs) * marks) if total_pairs else 0
+        status = "correct" if earned == marks else "partial" if earned > 0 else "incorrect"
         return {
             "score":    earned,
-            "feedback": f"{correct_count}/{total_pairs} correct matches.",
+            "feedback": f"{correct_count}/{total_pairs} correct. " + " | ".join(details),
             "status":   status
         }
 
-    # ── Open: AI marking against memo ────────────────
-    # If no memo → AI gives feedback only, awards partial for effort
-    if not student_answer or not student_answer.strip():
+    # ── Open ──────────────────────────────────────────────
+    if not student:
         return {"score": 0, "feedback": "No answer provided.", "status": "missing"}
 
-    if not memo or (isinstance(memo, str) and not memo.strip()):
-        # No memo — AI gives qualitative feedback, partial marks for attempting
-        try:
-            prompt = f"""You are a strict but fair CAT Grade 12 examiner.
+    memo_text = memo if isinstance(memo, str) else json.dumps(memo) if memo else ""
+    has_memo  = bool(memo_text.strip())
 
-The student answered the following question but no memo is available.
-Evaluate if the answer shows understanding of the topic.
+    prompt = f"""You are a strict South African NSC CAT examiner.
 
-Question ({marks} mark{"s" if marks > 1 else ""}):
+Question {question_number} ({marks} mark{"s" if marks != 1 else ""}):
 {question}
 
-Student Answer:
-{student_answer}
+{"Marking guideline:\n" + memo_text if has_memo else "No marking guideline — use CAT Grade 12 knowledge."}
 
-Return ONLY valid JSON:
+Student's answer:
+{student}
+
+Award marks strictly (1 mark per correct fact). Return ONLY valid JSON:
 {{
-  "score": {marks // 2},
-  "feedback": "short constructive feedback explaining what was good and what could improve",
-  "status": "partial"
-}}
-
-Note: Since no memo is available, award {marks // 2} marks if the answer shows reasonable understanding, else 0."""
-
-            response = client.chat.completions.create(
-                model=MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=200,
-                temperature=0
-            )
-            content = response.choices[0].message.content.strip()
-            if content.startswith("```"):
-                content = content.split("```")[1].lstrip("json").strip()
-            return json.loads(content)
-        except Exception as e:
-            return {"score": marks // 2, "feedback": "Answer noted — no memo to compare against.", "status": "partial"}
-
-    # ── Open with memo: AI compares meaning ──────────
-    try:
-        memo_text = memo if isinstance(memo, str) else json.dumps(memo)
-
-        prompt = f"""You are a strict but fair CAT Grade 12 examiner marking a student's answer.
-
-Question ({marks} mark{"s" if marks > 1 else ""}):
-{question}
-
-Expected Answer (from memo):
-{memo_text}
-
-Student's Answer:
-{student_answer}
-
-Marking Instructions:
-- Compare MEANING, not exact wording
-- Award full marks ({marks}) if the answer captures the key facts from the memo
-- Award partial marks if some correct understanding is shown
-- Award 0 if the answer is wrong or completely off-topic
-- Each mark = one distinct correct fact or point
-- Be consistent with real NSC exam marking
-
-Return ONLY valid JSON — no markdown, no explanation:
-{{
-  "score": <number between 0 and {marks}>,
-  "feedback": "<short, specific feedback — what was correct and what was missing>",
+  "score": <integer 0 to {marks}>,
+  "feedback": "<specific: what was correct, what was missing>",
   "status": "<correct | partial | incorrect>"
 }}"""
 
-        response = client.chat.completions.create(
-            model=MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=250,
-            temperature=0
-        )
-
-        content = response.choices[0].message.content.strip()
-        if content.startswith("```"):
-            content = content.split("```")[1].lstrip("json").strip()
-
-        result = json.loads(content)
-
-        # Safety clamp: score cannot exceed marks
-        result["score"] = max(0, min(int(result.get("score", 0)), marks))
-        return result
-
-    except Exception as e:
-        return {
-            "score":    0,
-            "feedback": f"⚠️ Could not evaluate answer: {e}",
-            "status":   "incorrect"
-        }
+    for attempt in range(2):
+        try:
+            r = client.chat.completions.create(
+                model=MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=250,
+                temperature=0
+            )
+            content = r.choices[0].message.content.strip()
+            if content.startswith("```"):
+                content = content.split("```")[1].lstrip("json").strip()
+            result = json.loads(content)
+            result["score"] = max(0, min(int(result.get("score", 0)), marks))
+            return result
+        except Exception as e:
+            if attempt == 0:
+                time.sleep(5)
+            else:
+                return {"score": 0, "feedback": f"Could not mark: {e}", "status": "incorrect"}
 
 
 # =========================
 # 📋 BATCH MARKER
-# Marks all questions in a session using memo from exam JSON.
-# Called by app.py /submit endpoint.
+# IMPORTANT: memo comes from q["memo"] inside each question dict.
+# We do NOT call load_exam_memo() or look up by question_number
+# from a separate dict — that was the bug causing Kickstarter/1.1 mismatch.
 # =========================
 def mark_exam_batch(exam_name, flat_questions, student_answers):
     """
-    Marks all student answers for a full exam.
+    flat_questions: list of question dicts from flatten_exam().
+      Each dict already has q["memo"] set correctly for that question.
+      app.py also sets q["student_answer"] before calling this.
 
-    Args:
-        exam_name       : filename of the exam JSON (to load memo)
-        flat_questions  : list of question dicts from flatten_exam()
-        student_answers : dict { "0": "answer", "1": "answer", ... }
-
-    Returns:
-        {
-          "results": [...],
-          "total_score": int,
-          "total_marks": int
-        }
+    student_answers: { "0": "answer", ... } — backup if student_answer not set.
     """
-    # Load memo directly from exam JSON
-    # This ensures marking always uses the extracted memo,
-    # not the theory book or any hardcoded values
-    exam_memo = load_exam_memo(exam_name)
-
-    if not exam_memo:
-        print(f"⚠️  No memo found in {exam_name} — marking will use inline memo fields only.")
-
     results     = []
     total_score = 0
     total_marks = 0
 
     for i, q in enumerate(flat_questions):
-        student_ans     = student_answers.get(str(i), "").strip()
-        q_num           = q.get("question_number", "")
-        q_type          = q.get("type", "open")
-        marks           = q.get("marks", 1)
-        question_text   = q.get("question", "")
+        q_num   = q.get("question_number", f"Q{i+1}")
+        q_type  = q.get("type", "open").lower()
+        marks   = int(q.get("marks", 1))
+        q_text  = q.get("question", "")
+        options = q.get("options")  # for MCQ option text in feedback
 
-        # ── Get memo: prefer loaded exam memo, fallback to inline field ──
-        memo = exam_memo.get(q_num) or q.get("memo", "")
+        # ── Get memo directly from the question dict ──────
+        # This is the ONLY correct way. Never look up by index or
+        # from a separate memo dict — that caused the Kickstarter bug.
+        memo = q.get("memo", "")
+
+        # ── Get student answer ────────────────────────────
+        # app.py sets student_answer on the dict; fall back to answers dict
+        student = q.get("student_answer", student_answers.get(str(i), ""))
+        if student is None:
+            student = ""
+        student = str(student).strip()
+
+        # Debug log — remove after confirming fix
+        print(f"  MARKING {q_num} | type={q_type} | memo={repr(str(memo)[:60])} | student={repr(student[:40])}")
 
         result = mark_answer(
-            question        = question_text,
+            question        = q_text,
             question_number = q_num,
             q_type          = q_type,
-            student_answer  = student_ans,
+            student_answer  = student,
             memo            = memo,
-            marks           = marks
+            marks           = marks,
+            options         = options
         )
 
+        # Format correct_answer for display
+        if isinstance(memo, dict) and memo:
+            correct_display = " | ".join(f"{k.split()[0]} → {v}" for k, v in memo.items())
+        elif memo:
+            # For MCQ, enrich with option text
+            if q_type == "mcq" and options:
+                correct_letter = str(memo).strip().upper()
+                for opt in (options or []):
+                    if isinstance(opt, dict) and opt.get("key","").upper() == correct_letter:
+                        correct_display = f"{correct_letter}. {opt['value']}"
+                        break
+                else:
+                    correct_display = str(memo)
+            else:
+                correct_display = str(memo)
+        else:
+            correct_display = "Not available"
+
         result["question_number"] = q_num
-        result["question"]        = question_text
+        result["question"]        = q_text
         result["type"]            = q_type
         result["marks"]           = marks
-        result["student_answer"]  = student_ans or "No answer"
-
-        # Format memo for display in results
-        if isinstance(memo, dict):
-            result["correct_answer"] = " | ".join(f"{k} → {v}" for k, v in memo.items())
-        elif memo:
-            result["correct_answer"] = str(memo)
-        else:
-            result["correct_answer"] = "Not available"
+        result["student_answer"]  = student or "No answer"
+        result["correct_answer"]  = correct_display
+        result["earned"]          = result.get("score", 0)
 
         results.append(result)
-        total_score += result.get("score", 0)
+        total_score += result["earned"]
         total_marks += marks
 
     return {
@@ -354,47 +268,26 @@ def mark_exam_batch(exam_name, flat_questions, student_answers):
 
 # =========================
 # 🧾 EXAM FEEDBACK SUMMARY
-# Generates overall performance feedback after marking
 # =========================
 def generate_exam_feedback(results, score, total, percentage):
-    """
-    Generates a short personalised performance summary.
-    """
     try:
-        # Build a concise summary for the AI — avoid sending full answers
         summary = [
-            {
-                "question_number": r.get("question_number"),
-                "type":            r.get("type"),
-                "marks":           r.get("marks"),
-                "score":           r.get("score"),
-                "status":          r.get("status")
-            }
+            {"q": r.get("question_number"), "type": r.get("type"),
+             "marks": r.get("marks"), "score": r.get("score"), "status": r.get("status")}
             for r in results
         ]
+        prompt = f"""You are a motivating CAT Grade 12 teacher.
+Score: {score}/{total} ({percentage}%)
+Breakdown: {json.dumps(summary)}
 
-        prompt = f"""You are a motivating CAT Grade 12 teacher reviewing a student's exam performance.
+Write 3-4 sentences: acknowledge the score, highlight strengths, identify weakest area, end with encouragement."""
 
-Score: {score} / {total} ({percentage}%)
-
-Question breakdown:
-{json.dumps(summary, indent=2)}
-
-Write a short performance summary (3–4 sentences) that:
-- Acknowledges the score warmly
-- Highlights what went well (correct/partial answers)
-- Identifies the weakest area to focus on
-- Ends with encouragement
-
-Keep it friendly, specific, and motivating."""
-
-        response = client.chat.completions.create(
+        r = client.chat.completions.create(
             model=MODEL,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=220,
             temperature=0.4
         )
-        return response.choices[0].message.content.strip()
-
+        return r.choices[0].message.content.strip()
     except Exception as e:
         return f"You scored {score}/{total} ({percentage}%). Keep practising! 🚀"
