@@ -1,0 +1,149 @@
+Got it — here’s a **simple, clean, no-frills README** you can paste directly and push. It’s focused, professional, and explains your backend clearly without extra noise.
+
+---
+
+```md
+# EduCAT Backend — AI Exam Study System
+
+This is the backend for EduCAT, an AI-powered exam study platform for Grade 12 CAT students.
+
+It is built using Flask and deployed on PythonAnywhere. The system uses an AI agent (not a basic chatbot) to help students study, write exams, and improve based on their performance.
+
+---
+
+## Overview
+
+The backend handles:
+
+- AI tutoring via an agent-based system
+- Exam simulation and answer submission
+- Automatic marking of different question types
+- Student progress tracking and weak topic detection
+- Retrieval of theory content using RAG (FAISS)
+- Persistent student memory using SQLite
+
+The AI decides what to do based on the student’s input and history, instead of following fixed logic.
+
+---
+
+## How the AI Agent Works
+
+The system uses a loop where the AI can decide to call tools before responding.
+
+Example flow:
+1. Student sends a message
+2. AI checks memory (weak topics, history)
+3. AI decides whether to:
+   - search theory
+   - generate a hint
+   - update study plan
+4. AI returns a final response
+
+This allows dynamic and personalised behaviour for each student.
+
+---
+
+## API Endpoints
+
+Base URL (production):
+```
+
+[https://abitonp.pythonanywhere.com](https://abitonp.pythonanywhere.com)
+
+````
+
+Main routes:
+
+- `POST /agent-chat` → chat with AI agent
+- `POST /start-exam` → start exam session
+- `POST /question` → get a question
+- `POST /answer` → save an answer
+- `POST /submit` → submit and mark exam
+- `POST /dashboard` → get student progress
+- `POST /clear-history` → reset conversation
+
+---
+
+## Memory System (SQLite)
+
+The backend stores student data locally in SQLite:
+
+- students → identity
+- sessions → exam results
+- weak_questions → tracks mistakes
+- conversation_history → chat logs
+- study_plan → personalised plan
+
+This memory is used by the AI on every request.
+
+---
+
+## Exam Engine
+
+Supports:
+
+- Multiple Choice (exact match)
+- True/False
+- Matching questions
+- Open-ended questions (AI marking)
+
+Each question contains its own memo (`q["memo"]`), ensuring correct marking.
+
+---
+
+## RAG (Theory Search)
+
+- Uses FAISS for similarity search
+- Retrieves relevant textbook content
+- Injects context into AI responses
+
+---
+
+## Tech Stack
+
+- Python (Flask)
+- Groq LLM (llama-3.3-70b)
+- SQLite
+- FAISS
+
+---
+
+## Local Setup
+
+```bash
+git clone https://github.com/your-repo.git
+cd your-repo
+
+pip install flask flask-cors groq python-dotenv faiss-cpu
+
+echo "GROQ_API_KEY=your_key" > .env
+
+python app.py
+````
+
+Runs on:
+
+```
+http://localhost:8000
+```
+
+---
+
+## Deployment
+
+The backend is deployed on PythonAnywhere:
+
+* Flask app configured via WSGI
+* Environment variable for API key
+* SQLite database created automatically
+
+---
+
+## License
+
+MIT License
+
+```
+
+---
+
