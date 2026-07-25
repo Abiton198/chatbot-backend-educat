@@ -63,6 +63,7 @@ import firebase_admin
 from firebase_admin import credentials, firestore as fs_admin, storage, auth as fb_auth
 from collections import deque
 from google.cloud.firestore_v1.base_query import FieldFilter
+from google.cloud.firestore_v1.aggregation import AggregationQuery
 
 # Suppress harmless gevent thread cleanup KeyError
 import threading as _threading
@@ -431,66 +432,92 @@ app.register_blueprint(billing_bp)
 # ===========================================================
 # LIMIT ENFORCER==============
 # ==========================================================
-def check_school_limit(school_id: str, limit_type: str) -> tuple[bool, str]:
+def check_school_limit(school_id: str, limit_type: str) -> tuple:
     """
     Checks if a school has exceeded its tier limits.
-    limit_type: 'exams' | 'teachers' | 'students' (or 'teacher' / 'student')
-    Returns (is_allowed, error_message)
+
+    Args:
+        school_id:  Firestore school document ID
+        limit_type: 'exams' | 'teachers' | 'students' | 'teacher' | 'student' | 'exam'
+
+    Returns:
+        (is_allowed: bool, error_message: str)
+        is_allowed=True  → registration/upload can proceed
+        is_allowed=False → limit exceeded, show error_message to user
     """
     if not school_id:
         return False, "School ID is required."
 
-    school_doc = db.collection("schools").document(school_id).get()
+    # ── 1. Fetch school document ───────────────────────────────────────────
+    try:
+        school_doc = db.collection("schools").document(school_id).get()
+    except Exception as e:
+        print(f"[Limit Check] Could not fetch school {school_id}: {e}")
+        return True, ""   # Fail open — do not block on Firestore error
+
     if not school_doc.exists:
-        return False, "School not found."
+        return False, "School not found. Please ask your principal to register the school first."
 
     school_data = school_doc.to_dict() or {}
-    tier_id = school_data.get("tier", "free").lower()
+    tier_id     = school_data.get("tier", "free").lower().strip()
 
-    # Normalize limit key (e.g. 'teacher' -> 'teachers')
+    # ── 2. Normalize limit key ─────────────────────────────────────────────
     normalized_key = limit_type.lower().strip()
     if normalized_key in ("teacher", "student", "exam"):
-        normalized_key = f"{normalized_key}s"
+        normalized_key = f"{normalized_key}s"   # 'teacher' → 'teachers' etc.
 
-    limits = {
-        "free":     {"exams": 4,   "teachers": 2,  "students": 30},
-        "silver":   {"exams": 15,  "teachers": 5,  "students": 150},
-        "gold":     {"exams": 30,  "teachers": 10, "students": 300},
-        "platinum": {"exams": 80,  "teachers": 25, "students": 800},
-        "diamond":  {"exams": 150, "teachers": 50, "students": 2000},
+    if normalized_key not in ("exams", "teachers", "students"):
+        print(f"[Limit Check] Unknown limit_type: {limit_type}")
+        return True, ""   # Unknown type — fail open
+
+    # ── 3. Tier limits table ───────────────────────────────────────────────
+    LIMITS = {
+        "free":     {"exams":  4,   "teachers":  2,  "students":    30},
+        "silver":   {"exams": 15,   "teachers":  5,  "students":   150},
+        "gold":     {"exams": 30,   "teachers": 10,  "students":   300},
+        "platinum": {"exams": 80,   "teachers": 25,  "students":   800},
+        "diamond":  {"exams": 150,  "teachers": 50,  "students":  2000},
     }
 
-    tier_limits = limits.get(tier_id, limits["free"])
+    tier_limits = LIMITS.get(tier_id, LIMITS["free"])
     max_allowed = tier_limits.get(normalized_key, 0)
 
+    # ── 4. Count current records ───────────────────────────────────────────
     try:
         if normalized_key == "exams":
-            # Fast count aggregation for exams
-            query = db.collection("exams").where(filter=FieldFilter("schoolId", "==", school_id)).count()
-            current_count = query.get()[0][0].value
+            # Count exams belonging to this school
+            current_count = len(list(
+                db.collection("exams")
+                  .where(filter=FieldFilter("schoolId", "==", school_id))
+                  .stream()
+            ))
 
-        elif normalized_key in ("teachers", "students"):
-            # Extract 'teacher' or 'student' for Firestore role field matching
-            role_target = normalized_key[:-1]
-            query = (
-                db.collection("users")
-                .where(filter=FieldFilter("schoolId", "==", school_id))
-                .where(filter=FieldFilter("role", "==", role_target))
-                .count()
-            )
-            current_count = query.get()[0][0].value
         else:
-            return True, ""
+            # teachers or students — query users collection by role
+            role_target = normalized_key[:-1]   # 'teachers' → 'teacher'
+            current_count = len(list(
+                db.collection("users")
+                  .where(filter=FieldFilter("schoolId", "==", school_id))
+                  .where(filter=FieldFilter("role",     "==", role_target))
+                  .stream()
+            ))
 
     except Exception as e:
-        print(f"[Limit Check Error]: {e}")
-        # Fail safe or fall back to standard collection read
-        return True, ""
+        print(f"[Limit Check] Count query failed for {school_id}/{normalized_key}: {e}")
+        return True, ""   # Fail open — never block on query error
+
+    # ── 5. Evaluate ────────────────────────────────────────────────────────
+    print(f"[Limit Check] {school_id} | {tier_id} tier | "
+          f"{normalized_key}: {current_count}/{max_allowed}")
 
     if current_count >= max_allowed:
+        tier_display = tier_id.capitalize()
+        type_display = normalized_key.rstrip("s") if normalized_key != "exams" else "exam"
         return (
             False,
-            f"School has reached the {tier_id.capitalize()} tier limit for {normalized_key} ({max_allowed}). Please upgrade your plan."
+            f"Your school has reached the {tier_display} plan limit of "
+            f"{max_allowed} {normalized_key}. "
+            f"Please ask your principal to upgrade the plan to add more {normalized_key}."
         )
 
     return True, ""
