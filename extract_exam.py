@@ -150,10 +150,15 @@ class ExamMetadata:
 # ═══════════════════════════════════════════════════════════════════════════════
 # PROMPTS
 # ═══════════════════════════════════════════════════════════════════════════════
+def render_prompt(template: str, text: str) -> str:
+    if "{text}" not in template:
+        raise ValueError("template is missing the {text} placeholder")
+    return template.replace("{text}", text)
+
 
 EXTRACTION_SYSTEM_PROMPT = """You are an expert parser for South African NSC exam papers across ALL subjects.
 
-Extract exam questions losslessly. Preserve exact wording, options, formulas, diagrams references, tables.
+Extract exam questions losslessly. Preserve exact wording, options, formulas, diagram references, tables.
 
 SUBJECTS: Mathematics, Physical Sciences, Life Sciences, Geography, History, Accounting, Economics, Business Studies, CAT, IT, Engineering Graphics & Design, Languages, and any other CAPS subject.
 
@@ -169,6 +174,19 @@ QUESTION TYPE RULES:
 - "Read the passage" / "Refer to the text" -> comprehension
 - Default -> open
 
+SOURCE MATERIAL — parent_context (READ THIS CAREFULLY):
+Exam papers print shared material ONCE above a group of questions: a reading
+passage, a literary extract, a case study, a newspaper source, a described
+cartoon, a scenario, a data set, or a set of given values. Every question in
+that group is unanswerable without it.
+
+- Copy that material VERBATIM into "parent_context".
+- Repeat it on EVERY question in the group, including every sub-question.
+- Never write "see above", "refer to the passage", or a summary. Copy the text.
+- Use null ONLY when the question is genuinely self-contained.
+- If the paper says "Read the extract below and answer the questions", the
+  extract belongs in parent_context for all questions that follow it.
+
 CRITICAL:
 1. NEVER summarize or rephrase
 2. NEVER skip questions
@@ -176,6 +194,7 @@ CRITICAL:
 4. Question numbers must match exactly (1.1, 2.3.1, 4.7.1, 10.3.2)
 5. Extract marks from brackets after each question
 6. Handle sub-parts with dot notation
+7. parent_context must contain the actual source text, never a reference to it
 """
 
 EXTRACTION_PROMPT_TEMPLATE = """
@@ -202,12 +221,31 @@ OUTPUT FORMAT:
           "id": 1,
           "question_number": "1.1",
           "parent_question": "QUESTION 1",
-          "parent_context": null,
-          "question": "Exact text with $E=mc^2$ formulas",
-          "question_type": "mcq",
-          "marks": 1,
+          "parent_context": "Read the extract below and answer the questions that follow.\\n\\nThe migration of workers to the Witwatersrand after 1886 reshaped the region entirely. Within a decade the population of Johannesburg had grown from nothing to over 100 000, drawn by wages that no rural district could match. Families were split for years at a time...",
+          "question": "Exact text with $E=mc^2$ formulas preserved",
+          "question_type": "comprehension",
+          "marks": 2,
           "memo": "",
-          "options": {"A": "...", "B": "...", "C": "...", "D": "..."},
+          "options": null,
+          "column_a": null,
+          "column_b": null,
+          "diagram_refs": [],
+          "table_refs": [],
+          "formula": null,
+          "instructions": null,
+          "section": "A",
+          "sub_parts": []
+        },
+        {
+          "id": 2,
+          "question_number": "1.2",
+          "parent_question": "QUESTION 1",
+          "parent_context": "Read the extract below and answer the questions that follow.\\n\\nThe migration of workers to the Witwatersrand after 1886 reshaped the region entirely. Within a decade the population of Johannesburg had grown from nothing to over 100 000, drawn by wages that no rural district could match. Families were split for years at a time...",
+          "question": "Second question about the SAME extract, so parent_context repeats verbatim",
+          "question_type": "short_answer",
+          "marks": 3,
+          "memo": "",
+          "options": null,
           "column_a": null,
           "column_b": null,
           "diagram_refs": [],
@@ -257,6 +295,91 @@ OUTPUT FORMAT:
 TEXT TO EXTRACT:
 {text}
 """
+
+MIN_PASSAGE_CHARS = 160
+
+
+def _group_keys(q):
+    """Keys a question can be matched to its passage group by."""
+    keys = set()
+    label = (q.parent_question or "").strip().upper()
+    if label:
+        keys.add(label)
+    num = (q.question_number or "").strip()
+    if num:
+        keys.add(f"Q{num.split('.')[0]}")
+    return keys
+
+
+def _collect_passages(sections):
+    """Harvest every passage the LLM did manage to return, keyed by group."""
+    found = {}
+    for sec in sections:
+        for q in sec.questions:
+            for candidate in (q.parent_context, q.instructions):
+                text = (candidate or "").strip()
+                if len(text) >= MIN_PASSAGE_CHARS:
+                    for key in _group_keys(q):
+                        found.setdefault(key, text)
+    return found
+
+
+def _recover_passage(raw_text, group_number):
+    """
+    Pull the prose printed between 'QUESTION n' and its first sub-question.
+    Deliberately conservative: only returns text long enough to be real source
+    material, so a short instruction line is not mistaken for a passage.
+    """
+    if not group_number:
+        return ""
+    pattern = (
+        rf'QUESTION\s+{re.escape(str(group_number))}\b'
+        rf'(.*?)'
+        rf'(?=\n\s*{re.escape(str(group_number))}\.\d)'
+    )
+    match = re.search(pattern, raw_text, re.DOTALL | re.IGNORECASE)
+    if not match:
+        return ""
+    body = match.group(1).strip()
+    body = re.sub(r'\n{3,}', '\n\n', body)
+    return body if len(body) >= MIN_PASSAGE_CHARS else ""
+
+
+def propagate_context(sections, raw_text=""):
+    """
+    Fill parent_context on every question that needs it.
+    Returns (sections, filled_from_siblings, filled_from_raw_text).
+    """
+    passages = _collect_passages(sections)
+    from_siblings = 0
+    from_raw = 0
+    raw_cache = {}
+
+    for sec in sections:
+        for q in sec.questions:
+            if len((q.parent_context or "").strip()) >= MIN_PASSAGE_CHARS:
+                continue
+
+            # 1. A sibling in the same group already has it
+            hit = next((passages[k] for k in _group_keys(q) if k in passages), "")
+            if hit:
+                q.parent_context = hit
+                from_siblings += 1
+                continue
+
+            # 2. Recover it from the raw paper text
+            if not raw_text:
+                continue
+            group = (q.question_number or "").split('.')[0]
+            if group not in raw_cache:
+                raw_cache[group] = _recover_passage(raw_text, group)
+            if raw_cache[group]:
+                q.parent_context = raw_cache[group]
+                for key in _group_keys(q):
+                    passages.setdefault(key, raw_cache[group])
+                from_raw += 1
+
+    return sections, from_siblings, from_raw
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -353,43 +476,54 @@ def infer_question_type(question_text, options=None, column_a=None, instructions
 
 
 def extract_questions_universal(text):
-    prompt = EXTRACTION_PROMPT_TEMPLATE.format(text=text[:15000])
     try:
-        result = extract_with_llm(prompt)
+        prompt = render_prompt(EXTRACTION_PROMPT_TEMPLATE, text[:15000])
+        full_prompt = f"{EXTRACTION_SYSTEM_PROMPT}\n\n{prompt}"
+        result = extract_with_llm(full_prompt)
     except Exception as e:
-        print(f"    LLM extraction failed: {e}")
+        print(f"    LLM extraction failed: {type(e).__name__}: {e}")
         return _fallback_extraction(text)
 
-    metadata = ExamMetadata(**result.get("metadata", {}))
-    sections_raw = result.get("sections", [])
-    sections = []
+    metadata = ExamMetadata(**{
+        k: v for k, v in (result.get("metadata") or {}).items()
+        if k in ExamMetadata.__dataclass_fields__
+    })
 
-    for sec_data in sections_raw:
+    sections = []
+    for sec_data in result.get("sections", []):
         questions = []
         for q_data in sec_data.get("questions", []):
             q_type = q_data.get("question_type", "open")
-            if q_type in ["open", "unknown", ""]:
-                q_type = infer_question_type(
+            if q_type in ["open", "unknown", "", None]:
+                q_data["question_type"] = infer_question_type(
                     q_data.get("question", ""),
                     q_data.get("options"),
                     q_data.get("column_a"),
-                    q_data.get("instructions", "")
+                    q_data.get("instructions", ""),
                 )
-                q_data["question_type"] = q_type
 
-            diagram_refs = [DiagramRef(**d) for d in q_data.get("diagram_refs", []) if isinstance(d, dict)]
-            table_refs = [TableRef(**t) for t in q_data.get("table_refs", []) if isinstance(t, dict)]
-            q_data["diagram_refs"] = diagram_refs
-            q_data["table_refs"] = table_refs
+            q_data["diagram_refs"] = [
+                DiagramRef(**d) for d in (q_data.get("diagram_refs") or [])
+                if isinstance(d, dict)
+            ]
+            q_data["table_refs"] = [
+                TableRef(**t) for t in (q_data.get("table_refs") or [])
+                if isinstance(t, dict)
+            ]
 
-            questions.append(Question(**q_data))
+            # An unexpected key from the model would raise TypeError and lose
+            # the whole window. Drop unknown keys instead.
+            clean = {k: v for k, v in q_data.items() if k in Question.__dataclass_fields__}
+            clean.setdefault("id", len(questions) + 1)
+            clean.setdefault("question_number", "")
+            questions.append(Question(**clean))
 
         sections.append(Section(
             section=sec_data.get("section", "A"),
             section_title=sec_data.get("section_title", ""),
             section_instructions=sec_data.get("section_instructions", ""),
             total_marks=sec_data.get("total_marks"),
-            questions=questions
+            questions=questions,
         ))
 
     return metadata, sections
@@ -445,12 +579,12 @@ def _fallback_extraction(text):
 
 
 def extract_memo_universal(text):
-    prompt = MEMO_PROMPT_TEMPLATE.format(text=text[:15000])
     try:
+        prompt = render_prompt(MEMO_PROMPT_TEMPLATE, text[:15000])
         result = extract_with_llm(prompt)
-        return result.get("answers", {})
+        return result.get("answers", {}) or {}
     except Exception as e:
-        print(f"    Memo LLM extraction failed: {e}")
+        print(f"    Memo LLM extraction failed: {type(e).__name__}: {e}")
         return _fallback_memo_extraction(text)
 
 
@@ -564,28 +698,37 @@ def deduplicate_questions(sections):
 # MEMO INJECTION
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
 def inject_memo_universal(sections, memo_answers):
     matched = 0
     unmatched = []
+
     for section in sections:
         for q in section.questions:
-            q_num = q.question_number.strip()
+            q_num = (q.question_number or "").strip()
+
             if q_num in memo_answers:
                 q.memo = memo_answers[q_num]
                 matched += 1
                 continue
+
             clean_num = re.sub(r'\.0+$', '', q_num)
-            if clean_num in memo_answers and clean_num != q_num:
+            if clean_num != q_num and clean_num in memo_answers:
                 q.memo = memo_answers[clean_num]
                 matched += 1
                 continue
-            if q.sub_parts:
-                for sub in q.sub_parts:
-                    sub_num = sub.get("sub_number", "")
-                    if sub_num in memo_answers:
-                        sub["memo"] = memo_answers[sub_num]
-                        matched += 1
-            unmatched.append(q_num)
+
+            sub_hit = False
+            for sub in (q.sub_parts or []):
+                sub_num = sub.get("sub_number", "")
+                if sub_num in memo_answers:
+                    sub["memo"] = memo_answers[sub_num]
+                    matched += 1
+                    sub_hit = True
+
+            if not sub_hit:
+                unmatched.append(q_num)
+
     return sections, matched, unmatched
 
 
