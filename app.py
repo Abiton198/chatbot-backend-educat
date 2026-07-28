@@ -69,13 +69,15 @@ from google.cloud.firestore_v1.aggregation import AggregationQuery
 import threading as _threading
 _original_delete = _threading.Thread._delete
 
+from firebase_admin import auth as fb_auth
+from tier_limits import check_school_limit, get_db
+
 def _safe_thread_delete(self):
     try:
         _original_delete(self)
     except KeyError:
         pass
 _threading.Thread._delete = _safe_thread_delete
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # AI PROVIDER LAYER — Groq → Gemini automatic fallback
@@ -432,95 +434,7 @@ app.register_blueprint(billing_bp)
 # ===========================================================
 # LIMIT ENFORCER==============
 # ==========================================================
-def check_school_limit(school_id: str, limit_type: str) -> tuple:
-    """
-    Checks if a school has exceeded its tier limits.
-
-    Args:
-        school_id:  Firestore school document ID
-        limit_type: 'exams' | 'teachers' | 'students' | 'teacher' | 'student' | 'exam'
-
-    Returns:
-        (is_allowed: bool, error_message: str)
-        is_allowed=True  → registration/upload can proceed
-        is_allowed=False → limit exceeded, show error_message to user
-    """
-    if not school_id:
-        return False, "School ID is required."
-
-    # ── 1. Fetch school document ───────────────────────────────────────────
-    try:
-        school_doc = db.collection("schools").document(school_id).get()
-    except Exception as e:
-        print(f"[Limit Check] Could not fetch school {school_id}: {e}")
-        return True, ""   # Fail open — do not block on Firestore error
-
-    if not school_doc.exists:
-        return False, "School not found. Please ask your principal to register the school first."
-
-    school_data = school_doc.to_dict() or {}
-    tier_id     = school_data.get("tier", "free").lower().strip()
-
-    # ── 2. Normalize limit key ─────────────────────────────────────────────
-    normalized_key = limit_type.lower().strip()
-    if normalized_key in ("teacher", "student", "exam"):
-        normalized_key = f"{normalized_key}s"   # 'teacher' → 'teachers' etc.
-
-    if normalized_key not in ("exams", "teachers", "students"):
-        print(f"[Limit Check] Unknown limit_type: {limit_type}")
-        return True, ""   # Unknown type — fail open
-
-    # ── 3. Tier limits table ───────────────────────────────────────────────
-    LIMITS = {
-        "free":     {"exams":  4,   "teachers":  2,  "students":    30},
-        "silver":   {"exams": 15,   "teachers":  5,  "students":   150},
-        "gold":     {"exams": 30,   "teachers": 10,  "students":   300},
-        "platinum": {"exams": 80,   "teachers": 25,  "students":   800},
-        "diamond":  {"exams": 150,  "teachers": 50,  "students":  2000},
-    }
-
-    tier_limits = LIMITS.get(tier_id, LIMITS["free"])
-    max_allowed = tier_limits.get(normalized_key, 0)
-
-    # ── 4. Count current records ───────────────────────────────────────────
-    try:
-        if normalized_key == "exams":
-            # Count exams belonging to this school
-            current_count = len(list(
-                db.collection("exams")
-                  .where(filter=FieldFilter("schoolId", "==", school_id))
-                  .stream()
-            ))
-
-        else:
-            # teachers or students — query users collection by role
-            role_target = normalized_key[:-1]   # 'teachers' → 'teacher'
-            current_count = len(list(
-                db.collection("users")
-                  .where(filter=FieldFilter("schoolId", "==", school_id))
-                  .where(filter=FieldFilter("role",     "==", role_target))
-                  .stream()
-            ))
-
-    except Exception as e:
-        print(f"[Limit Check] Count query failed for {school_id}/{normalized_key}: {e}")
-        return True, ""   # Fail open — never block on query error
-
-    # ── 5. Evaluate ────────────────────────────────────────────────────────
-    print(f"[Limit Check] {school_id} | {tier_id} tier | "
-          f"{normalized_key}: {current_count}/{max_allowed}")
-
-    if current_count >= max_allowed:
-        tier_display = tier_id.capitalize()
-        type_display = normalized_key.rstrip("s") if normalized_key != "exams" else "exam"
-        return (
-            False,
-            f"Your school has reached the {tier_display} plan limit of "
-            f"{max_allowed} {normalized_key}. "
-            f"Please ask your principal to upgrade the plan to add more {normalized_key}."
-        )
-
-    return True, ""
+# now has tier_limits.py
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2102,18 +2016,71 @@ def register_user():
 # ===========================================================
 @app.route("/check-tier-limit", methods=["POST", "OPTIONS"])
 def api_check_tier_limit():
-    # Handle CORS preflight explicitly if needed
+    """
+    Advisory tier pre-check. The write endpoints (/exams/upload, registration)
+    are the authoritative enforcement points — this exists only so the client
+    can avoid pushing files to Storage that would be rejected anyway.
+
+    Contract:
+      200 {"status": "allowed", "usage": n, "limit": m}
+      403 {"error": "limit_reached", "message": "..."}   → block the action
+      401 {"error": "invalid_token"}                      → re-auth
+      503 {"error": "check_unavailable"}                  → client proceeds
+    """
+    # Empty 204 so flask-cors' after_request hook attaches the headers.
+    # A jsonify() here can short-circuit that and break the preflight.
     if request.method == "OPTIONS":
-        return jsonify({"status": "ok"}), 200
+        return ("", 204)
 
-    data = request.json or {}
-    school_id = data.get("schoolId")
-    limit_type = data.get("role") or data.get("limitType")
+    # ── 1. Authenticate ────────────────────────────────────────────────────
+    header = request.headers.get("Authorization", "")
+    if not header.startswith("Bearer "):
+        return jsonify({"error": "missing_token"}), 401
 
-    if not school_id or not limit_type:
-        return jsonify({"error": "Missing schoolId or limit_type"}), 400
+    try:
+        decoded = fb_auth.verify_id_token(header.split("Bearer ", 1)[1])
+    except Exception as exc:
+        app.logger.warning("check-tier-limit token rejected: %s: %s",
+                           type(exc).__name__, exc)
+        return jsonify({"error": "invalid_token", "detail": type(exc).__name__}), 401
 
-    allowed, message = check_school_limit(school_id, limit_type)
+    uid = decoded.get("uid")
+
+    # ── 2. Read the requested resource ─────────────────────────────────────
+    data = request.get_json(silent=True) or {}
+    limit_type = data.get("role") or data.get("limitType") or data.get("resource")
+
+    if not limit_type:
+        return jsonify({"error": "Missing limit_type"}), 400
+
+    # ── 3. Resolve the school server-side ──────────────────────────────────
+    # schoolId is never taken from the body. A client sending an arbitrary
+    # schoolId could otherwise read any school's tier state.
+    try:
+        user_doc = get_db().collection("users").document(uid).get(timeout=8.0)
+    except Exception as exc:
+        app.logger.warning("check-tier-limit user lookup failed for %s: %s: %s",
+                           uid, type(exc).__name__, exc)
+        return jsonify({"error": "check_unavailable"}), 503
+
+    if not user_doc.exists:
+        return jsonify({"error": "no_profile"}), 403
+
+    school_id = (user_doc.to_dict() or {}).get("schoolId")
+    if not school_id:
+        return jsonify({"error": "no_school"}), 403
+
+    claimed = data.get("schoolId")
+    if claimed and claimed != school_id:
+        app.logger.warning("uid %s claimed schoolId %s but belongs to %s",
+                           uid, claimed, school_id)
+
+    # ── 4. Check ───────────────────────────────────────────────────────────
+    try:
+        allowed, message = check_school_limit(school_id, limit_type)
+    except Exception as exc:
+        app.logger.exception("check_school_limit crashed for %s/%s", school_id, limit_type)
+        return jsonify({"error": "check_unavailable", "detail": type(exc).__name__}), 503
 
     if not allowed:
         return jsonify({"error": "limit_reached", "message": message}), 403
