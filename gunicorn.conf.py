@@ -6,7 +6,7 @@ import os
 # event loop, so any Firestore call from a greenlet blocks the hub forever —
 # no exception raised, so no error handler can recover. google-cloud-firestore
 # is thread-safe, so threads give the same I/O concurrency without the trap.
-workers      = 2
+workers      = 1
 worker_class = "gthread"
 threads      = 8
 

@@ -30,7 +30,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import os
-import io
+import resource
 import re
 import json
 import time
@@ -1283,7 +1283,8 @@ def _load_exam_memos(exam_id: str) -> dict:
 # ══════════════════════════════════════════════════════════════════════════════
 # ROUTES
 # ══════════════════════════════════════════════════════════════════════════════
-
+mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+app.logger.info("mem: %.0f MB (pid %s)", mb, os.getpid())
 @app.route("/", methods=["GET"])
 def health():
     """Public health check — used by the frontend keep-alive ping."""
