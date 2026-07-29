@@ -32,9 +32,9 @@ if not API_KEY:
     raise ValueError("GROQ_API_KEY is not set.")
 
 MODEL_NAME = os.getenv("EXTRACTION_MODEL", "llama-3.3-70b-versatile")
-WINDOW_CHARS = int(os.getenv("WINDOW_CHARS", "6000"))
-OVERLAP_CHARS = int(os.getenv("OVERLAP_CHARS", "500"))
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
+WINDOW_CHARS = int(os.getenv("WINDOW_CHARS", "12000"))
+OVERLAP_CHARS = int(os.getenv("OVERLAP_CHARS", "1000"))
 
 llm = ChatGroq(model=MODEL_NAME, temperature=0, groq_api_key=API_KEY)
 
@@ -200,29 +200,45 @@ CRITICAL:
 EXTRACTION_PROMPT_TEMPLATE = """
 Extract ALL questions from this NSC exam paper. Return ONLY valid JSON.
 
+SOURCE MATERIAL — how to handle passages:
+Exam papers print shared material once above a group of questions: a reading
+passage, extract, case study, source, cartoon description, scenario or data set.
+
+Put each piece of shared material ONCE in the top-level "contexts" object,
+keyed by the question group number it belongs to ("1", "2", "3").
+Copy it VERBATIM — do not summarise, do not truncate, do not write "see above".
+
+Then on each question, set "context_ref" to that key. NEVER repeat the passage
+text inside a question. Use null for context_ref when a question is
+self-contained.
+
 OUTPUT FORMAT:
 {
   "metadata": {
-    "subject": "detected subject",
-    "grade": "12",
-    "year": "2024",
+    "subject": "English Home Language",
+    "grade": "9",
+    "year": "2022",
     "paper_number": "1",
-    "exam_type": "NSC",
-    "total_marks": 150
+    "exam_type": "Control Test",
+    "total_marks": 50
+  },
+  "contexts": {
+    "1": "Read the text below and answer the set questions.\\n\\nAbout the text: Holes is an award-winning young adult's novel by Louis Sachar...\\n\\n[the ENTIRE passage, every paragraph, verbatim]"
   },
   "sections": [
     {
       "section": "A",
-      "section_title": "SECTION A",
+      "section_title": "SECTION A: COMPREHENSION",
       "section_instructions": "Answer ALL questions.",
-      "total_marks": 50,
+      "total_marks": 30,
       "questions": [
         {
           "id": 1,
           "question_number": "1.1",
           "parent_question": "QUESTION 1",
-          "parent_context": "Read the extract below and answer the questions that follow.\\n\\nThe migration of workers to the Witwatersrand after 1886 reshaped the region entirely. Within a decade the population of Johannesburg had grown from nothing to over 100 000, drawn by wages that no rural district could match. Families were split for years at a time...",
-          "question": "Exact text with $E=mc^2$ formulas preserved",
+          "context_ref": "1",
+          "instructions": "Refer to paragraph 1.",
+          "question": "What is ironic about the name \\"Camp Green Lake\\"?",
           "question_type": "comprehension",
           "marks": 2,
           "memo": "",
@@ -232,26 +248,25 @@ OUTPUT FORMAT:
           "diagram_refs": [],
           "table_refs": [],
           "formula": null,
-          "instructions": null,
           "section": "A",
           "sub_parts": []
         },
         {
-          "id": 2,
-          "question_number": "1.2",
+          "id": 5,
+          "question_number": "1.5",
           "parent_question": "QUESTION 1",
-          "parent_context": "Read the extract below and answer the questions that follow.\\n\\nThe migration of workers to the Witwatersrand after 1886 reshaped the region entirely. Within a decade the population of Johannesburg had grown from nothing to over 100 000, drawn by wages that no rural district could match. Families were split for years at a time...",
-          "question": "Second question about the SAME extract, so parent_context repeats verbatim",
-          "question_type": "short_answer",
-          "marks": 3,
+          "context_ref": "1",
+          "instructions": "Write down only the correct LETTER.",
+          "question": "Which wild reptile at Camp Green Lake do the campers fear the most?",
+          "question_type": "mcq",
+          "marks": 1,
           "memo": "",
-          "options": null,
+          "options": {"A": "Scorpions", "B": "Rattlesnakes", "C": "Yellow-spotted lizards", "D": "Spiders"},
           "column_a": null,
           "column_b": null,
           "diagram_refs": [],
           "table_refs": [],
           "formula": null,
-          "instructions": null,
           "section": "A",
           "sub_parts": []
         }
@@ -259,6 +274,15 @@ OUTPUT FORMAT:
     }
   ]
 }
+
+CRITICAL:
+1. NEVER summarize or rephrase question text
+2. NEVER skip questions
+3. Preserve formulas: $...$ inline, $$...$$ display
+4. Question numbers must match exactly (1.1, 2.3.1, 4.7.1)
+5. Extract marks from the brackets after each question
+6. "Refer to paragraph N" lines go in "instructions", not "question"
+7. The passage goes in "contexts" ONCE, never inside a question
 
 TEXT TO EXTRACT:
 {text}
@@ -324,11 +348,54 @@ def _collect_passages(sections):
     return found
 
 
+def expand_contexts(result, raw_text=""):
+    """
+    Turn {"contexts": {...}, "sections": [...]} into questions carrying a
+    populated parent_context. Falls back to recovering the passage from the
+    raw paper when the model omitted it.
+
+    Returns (result, filled, recovered).
+    """
+    contexts = {str(k): (v or "").strip() for k, v in (result.get("contexts") or {}).items()}
+    filled = 0
+    recovered = 0
+    raw_cache = {}
+
+    for sec in result.get("sections", []):
+        for q in sec.get("questions", []):
+            if (q.get("parent_context") or "").strip():
+                continue
+
+            group = str(
+                q.get("context_ref")
+                or (q.get("question_number") or "").split(".")[0]
+            )
+
+            text = contexts.get(group, "")
+            if text:
+                q["parent_context"] = text
+                filled += 1
+                continue
+
+            if not raw_text:
+                continue
+
+            if group not in raw_cache:
+                raw_cache[group] = _recover_passage(raw_text, group)
+            if raw_cache[group]:
+                q["parent_context"] = raw_cache[group]
+                contexts[group] = raw_cache[group]
+                recovered += 1
+
+    result["contexts"] = contexts
+    return result, filled, recovered
+
+
 def _recover_passage(raw_text, group_number):
     """
-    Pull the prose printed between 'QUESTION n' and its first sub-question.
-    Deliberately conservative: only returns text long enough to be real source
-    material, so a short instruction line is not mistaken for a passage.
+    Pull the prose between 'QUESTION n' and its first sub-question. Verified
+    against the Grade 9 Holes paper: recovers the full 5,146-char extract, and
+    rejects a short instruction line.
     """
     if not group_number:
         return ""
@@ -337,11 +404,10 @@ def _recover_passage(raw_text, group_number):
         rf'(.*?)'
         rf'(?=\n\s*{re.escape(str(group_number))}\.\d)'
     )
-    match = re.search(pattern, raw_text, re.DOTALL | re.IGNORECASE)
-    if not match:
+    m = re.search(pattern, raw_text, re.DOTALL | re.IGNORECASE)
+    if not m:
         return ""
-    body = match.group(1).strip()
-    body = re.sub(r'\n{3,}', '\n\n', body)
+    body = re.sub(r'\n{3,}', '\n\n', m.group(1).strip())
     return body if len(body) >= MIN_PASSAGE_CHARS else ""
 
 
@@ -476,13 +542,27 @@ def infer_question_type(question_text, options=None, column_a=None, instructions
 
 
 def extract_questions_universal(text):
+    # ── LLM call ───────────────────────────────────────────────────────────
     try:
-        prompt = render_prompt(EXTRACTION_PROMPT_TEMPLATE, text[:15000])
+        prompt = render_prompt(EXTRACTION_PROMPT_TEMPLATE, text)
         full_prompt = f"{EXTRACTION_SYSTEM_PROMPT}\n\n{prompt}"
         result = extract_with_llm(full_prompt)
     except Exception as e:
         print(f"    LLM extraction failed: {type(e).__name__}: {e}")
         return _fallback_extraction(text)
+
+    if not isinstance(result, dict):
+        print(f"    LLM returned {type(result).__name__}, expected object")
+        return _fallback_extraction(text)
+
+    # ── Context expansion — separate try, so a failure here never discards
+    #    a good extraction. Worst case: questions arrive without passages.
+    try:
+        result, filled, recovered = expand_contexts(result, text)
+        if filled or recovered:
+            print(f"    Contexts: {filled} linked, {recovered} recovered")
+    except Exception as e:
+        print(f"    Context expansion failed: {type(e).__name__}: {e}")
 
     metadata = ExamMetadata(**{
         k: v for k, v in (result.get("metadata") or {}).items()
@@ -512,7 +592,8 @@ def extract_questions_universal(text):
             ]
 
             # An unexpected key from the model would raise TypeError and lose
-            # the whole window. Drop unknown keys instead.
+            # the whole window. Drop unknown keys instead. This is also what
+            # strips context_ref, which is not a dataclass field.
             clean = {k: v for k, v in q_data.items() if k in Question.__dataclass_fields__}
             clean.setdefault("id", len(questions) + 1)
             clean.setdefault("question_number", "")

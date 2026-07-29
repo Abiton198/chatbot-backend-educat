@@ -425,32 +425,55 @@ def _convert_to_pdf(file_bytes: bytes, filename: str) -> Optional[bytes]:
         inp = os.path.join(tmp, filename)
         with open(inp, "wb") as f:
             f.write(file_bytes)
+
+        # Per-invocation profile. The old fixed /tmp/libreoffice-sandbox path
+        # is shared by every concurrent conversion; with gthread workers two
+        # uploads collide on the profile lock and LibreOffice dies with a
+        # generic "Unspecified Application Error". Inside tmp so it is cleaned
+        # up automatically.
+        profile = os.path.join(tmp, "loprofile")
+
         try:
-            subprocess.run(
+            result = subprocess.run(
                 [cmd, "--headless", "--norestore", "--nofirststartwizard",
-                 "--infilter=writer_pdf_Export",
-                 "-env:UserInstallation=file:///tmp/libreoffice-sandbox",
-                 "--convert-to", "pdf", "--outdir", tmp, inp],
-                check=True, timeout=90, capture_output=True,
+                 f"-env:UserInstallation=file://{profile}",
+                 # Export filter belongs after the colon in --convert-to.
+                 # It was previously passed as --infilter, which tells
+                 # LibreOffice to *read* the docx using a PDF export filter.
+                 "--convert-to", "pdf:writer_pdf_Export",
+                 "--outdir", tmp, inp],
+                timeout=90, capture_output=True,
                 env={**os.environ,
-                     "http_proxy":  "http://127.0.0.1:0",
+                     "HOME": tmp,
+                     "http_proxy": "http://127.0.0.1:0",
                      "https_proxy": "http://127.0.0.1:0",
                      "no_proxy": ""},
             )
+
+            stdout = result.stdout.decode(errors="replace")
+            stderr = result.stderr.decode(errors="replace")
+
             pdf_path = os.path.join(tmp, Path(filename).stem + ".pdf")
+
+            # soffice exits 0 even when conversion fails, so the only reliable
+            # success signal is the output file existing. check=True was never
+            # going to catch this.
             if os.path.exists(pdf_path):
                 with open(pdf_path, "rb") as f:
                     data = f.read()
                 logger.info("[LibreOffice] %s → PDF (%d bytes)", filename, len(data))
                 return data
-            logger.error("[LibreOffice] PDF not produced for %s", filename)
+
+            logger.error(
+                "[LibreOffice] PDF not produced for %s | exit=%s | stdout=%s | stderr=%s",
+                filename, result.returncode, stdout[:300], stderr[:300],
+            )
+
         except subprocess.TimeoutExpired:
             logger.error("[LibreOffice] Timeout converting %s", filename)
-        except subprocess.CalledProcessError as e:
-            logger.error("[LibreOffice] %s", e.stderr.decode(errors="replace")[:300])
-        except Exception as e:
-            logger.error("[LibreOffice] %s", e)
+
     return None
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════
