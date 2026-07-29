@@ -55,6 +55,8 @@ from groq import Groq
 
 logger = logging.getLogger(__name__)
 
+MIN_PASSAGE_CHARS = 160
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONSTANTS
@@ -907,14 +909,77 @@ def extract_text_from_file(file_bytes: bytes, filename: str,
 # TEXT FALLBACK PARSER — used when LibreOffice unavailable
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _recover_passage(raw_text: str, group_number: str) -> str:
+    """
+    Pull the prose printed between 'QUESTION n' and its first sub-question.
+    Used when the model omits a passage, or when a chunk boundary separates
+    the extract from the questions about it.
+    """
+    if not group_number:
+        return ""
+    pattern = (
+        rf'QUESTION\s+{re.escape(str(group_number))}\b'
+        rf'(.*?)'
+        rf'(?=\n\s*{re.escape(str(group_number))}\.\d)'
+    )
+    m = re.search(pattern, raw_text, re.DOTALL | re.IGNORECASE)
+    if not m:
+        return ""
+    body = re.sub(r'\n{3,}', '\n\n', m.group(1).strip())
+    body = re.sub(r'Refer to paragraph\s+\d+\.?\s*$', '', body).strip()
+    return body if len(body) >= MIN_PASSAGE_CHARS else ""
+
+
+def _expand_question_contexts(questions: list, contexts: dict, raw_text: str = ""):
+    """
+    Array-shaped context expansion. The model emits each passage once in
+    `contexts`; this copies it onto every question that references it, which
+    costs no tokens at all.
+
+    Returns (filled, recovered).
+    """
+    contexts = {str(k): (v or "").strip() for k, v in (contexts or {}).items()}
+    filled = recovered = 0
+    cache = {}
+
+    for q in questions:
+        if len((q.get("parent_context") or "").strip()) >= MIN_PASSAGE_CHARS:
+            continue
+
+        group = str(
+            q.get("context_ref")
+            or (q.get("question_number") or "").split(".")[0]
+        )
+
+        text = contexts.get(group, "")
+        if text:
+            q["parent_context"] = text
+            filled += 1
+            continue
+
+        if not raw_text:
+            continue
+
+        if group not in cache:
+            cache[group] = _recover_passage(raw_text, group)
+        if cache[group]:
+            q["parent_context"] = cache[group]
+            contexts[group] = cache[group]
+            recovered += 1
+
+    return filled, recovered
+
+
 def parse_questions_universal(exam_text: str,
-                               subject:   str,
-                               grade:     str) -> list[dict]:
+                              subject: str,
+                              grade: str) -> list[dict]:
     """LLM-based question parser for plain text. Chunked to stay within token limits."""
-    cat     = _subject_category(subject)
-    hints   = _PARSING_HINTS.get(cat, "")
+    cat = _subject_category(subject)
+    hints = _PARSING_HINTS.get(cat, "")
+
     all_qs: list[dict] = []
-    seen:   set[str]   = set()
+    seen: set[str] = set()
+    all_contexts: dict = {}
 
     chunks: list[str] = []
     start = 0
@@ -924,44 +989,93 @@ def parse_questions_universal(exam_text: str,
 
     for idx, chunk in enumerate(chunks):
         logger.info("[Parser] Chunk %d/%d — %s", idx + 1, len(chunks), subject)
-        prompt = f"""Parse this {subject} Grade {grade} exam into a JSON array.
 
+        prompt = f"""Parse this {subject} Grade {grade} exam into JSON.
 MCQ → type="mcq" + options dict. True/False → "true_false". Calculation → "calculation".
 Essay → "essay". Short answer → "short_answer". Default → "open".
-Marks from (2) or [2]. Include question_number, parent_question, parent_context, section.
+Marks from (2) or [2].
 {hints}
 
-Return ONLY a valid JSON array. Each item:
-{{"question_number":"1.1","parent_question":"QUESTION 1","parent_context":null,
+SOURCE MATERIAL — read carefully:
+Papers print shared material ONCE above a group of questions: a reading
+passage, extract, case study, source, scenario or data set. Every question in
+that group needs it.
+
+Put each piece of shared material ONCE in the top-level "contexts" object,
+keyed by its question group number ("1", "2"). Copy it VERBATIM, every
+paragraph, no summarising and no truncating.
+On each question set "context_ref" to that key. NEVER repeat the passage text
+inside a question. Use null for context_ref only when a question is fully
+self-contained.
+
+Return ONLY a valid JSON object of this exact shape:
+{{"contexts": {{"1": "Read the text below and answer the set questions.\\n\\n[the ENTIRE passage verbatim]"}},
+"questions": [
+{{"question_number":"1.1","parent_question":"QUESTION 1","context_ref":"1",
 "section":"A","question":"...","type":"open","marks":1,"options":null,
 "column_a":null,"column_b":null,"memo":null,"has_visual":false,
 "question_latex":null,"question_table":null}}
+]}}
 
 EXAM TEXT:
 {chunk}"""
 
-        for attempt, current_prompt in enumerate([prompt, prompt[:len(prompt)//2]]):
+        # Re-chunk on 413 rather than slicing the prompt string. The old
+        # prompt[:len(prompt)//2] cut the JSON schema in half and left the
+        # model with truncated instructions and half an exam.
+        attempts = [chunk, chunk[:len(chunk) // 2]]
+
+        for attempt, chunk_text in enumerate(attempts):
+            current_prompt = prompt if attempt == 0 else prompt.replace(chunk, chunk_text)
             try:
-                raw = ai_text(current_prompt, max_tokens=8000, temperature=0)
+                raw = ai_text(current_prompt, max_tokens=12000, temperature=0)
                 raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
-                raw = re.sub(r"\s*```\s*$",        "", raw, flags=re.MULTILINE)
-                m   = re.search(r"\[.*\]", raw, re.DOTALL)
-                if m:
-                    parsed = json.loads(m.group())
-                    if isinstance(parsed, list):
-                        for q in parsed:
-                            key = (_normalise_qnum(q.get("question_number", ""))
-                                   or q.get("question", "")[:60])
-                            if key not in seen:
-                                seen.add(key)
-                                all_qs.append(q)
+                raw = re.sub(r"\s*```\s*$", "", raw, flags=re.MULTILINE)
+
+                parsed = None
+
+                # Object shape first, then fall back to a bare array in case
+                # the model ignores the schema.
+                obj = re.search(r"\{.*\}", raw, re.DOTALL)
+                if obj:
+                    try:
+                        data = json.loads(obj.group())
+                        if isinstance(data, dict):
+                            parsed = data.get("questions") or []
+                            for k, v in (data.get("contexts") or {}).items():
+                                if v and str(k) not in all_contexts:
+                                    all_contexts[str(k)] = v
+                    except json.JSONDecodeError:
+                        parsed = None
+
+                if parsed is None:
+                    arr = re.search(r"\[.*\]", raw, re.DOTALL)
+                    if arr:
+                        data = json.loads(arr.group())
+                        parsed = data if isinstance(data, list) else []
+
+                for q in (parsed or []):
+                    key = (_normalise_qnum(q.get("question_number", ""))
+                           or q.get("question", "")[:60])
+                    if key not in seen:
+                        seen.add(key)
+                        all_qs.append(q)
                 break
+
             except Exception as e:
                 if "413" in str(e) and attempt == 0:
                     logger.warning("[Parser] Chunk %d too large, retrying at half", idx + 1)
                     continue
-                logger.error("[Parser] Chunk %d: %s", idx + 1, e)
+                logger.error("[Parser] Chunk %d: %s: %s", idx + 1, type(e).__name__, e)
                 break
 
-    logger.info("[Parser] %d questions extracted (text fallback)", len(all_qs))
-    return all_qs# rebuilt Mon Jul 20 02:03:46 PM SAST 2026
+    # Expand once, against the FULL text, so a passage in chunk 1 still
+    # reaches questions parsed from chunk 2.
+    filled, recovered = _expand_question_contexts(all_qs, all_contexts, exam_text)
+
+    with_ctx = sum(1 for q in all_qs if (q.get("parent_context") or "").strip())
+    logger.info(
+        "[Parser] %d questions extracted | contexts: %d passages, %d linked, %d recovered, %d/%d questions have context",
+        len(all_qs), len(all_contexts), filled, recovered, with_ctx, len(all_qs),
+    )
+    return all_qs
