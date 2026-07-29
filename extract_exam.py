@@ -43,7 +43,6 @@ OUTPUT_FOLDER = "exams"
 TRACK_FILE = "processed_exams.json"
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # DATA MODELS
 # ═══════════════════════════════════════════════════════════════════════════════

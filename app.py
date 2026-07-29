@@ -117,6 +117,21 @@ def _resolve_groq_model() -> str:
     return fallback
 
 
+GROQ_TPM_LIMIT = int(os.getenv("GROQ_TPM_LIMIT", "12000"))
+_GROQ_LOCK = threading.Lock()
+_last_groq_call = [0.0]
+
+
+def _is_rate_limited(err: str) -> bool:
+    return any(s in err.lower() for s in ("rate_limit", "429", "413", "tokens per minute", "tpm"))
+
+
+def _retry_after(err: str) -> float:
+    """Groq puts a wait hint in the message: 'try again in 6.2s'."""
+    m = re.search(r'try again in ([\d.]+)s', err, re.IGNORECASE)
+    return float(m.group(1)) if m else 0.0
+
+
 def ai_text(prompt: str,
             max_tokens: int = 2000,
             temperature: float = 0.1) -> str:
@@ -128,47 +143,90 @@ def ai_text(prompt: str,
     global _RESOLVED_GROQ_MODEL
     last_error: Exception | None = None
 
+    est_input = len(prompt) // 4
+
+    # Reserve no more output than the remaining per-minute budget allows,
+    # leaving headroom. Without this clamp a large max_tokens guarantees a 413.
+    ceiling = max(512, GROQ_TPM_LIMIT - est_input - 600)
+    capped = min(max_tokens, ceiling)
+    if capped < max_tokens:
+        print(f"[AI] max_tokens {max_tokens} → {capped} (TPM budget, input ~{est_input})")
+
     # ── 1. Groq ───────────────────────────────────────────────────────────────
     groq_key = os.getenv("GROQ_API_KEY")
     if groq_key:
-        for attempt in range(2):
+        for attempt in range(3):
             try:
-                client = Groq(api_key=groq_key)
-                resp   = client.chat.completions.create(
-                    model=_resolve_groq_model(),
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                )
+                # One Groq call at a time, paced against the TPM budget.
+                # Two concurrent uploads would otherwise share — and blow —
+                # the same per-minute allowance.
+                with _GROQ_LOCK:
+                    cost_seconds = ((est_input + capped) / GROQ_TPM_LIMIT) * 60
+                    wait = cost_seconds - (time.time() - _last_groq_call[0])
+                    if wait > 0:
+                        print(f"[Groq] pacing {wait:.1f}s for TPM budget")
+                        time.sleep(wait)
+
+                    client = Groq(api_key=groq_key)
+                    resp = client.chat.completions.create(
+                        model=_resolve_groq_model(),
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=temperature,
+                        max_tokens=capped,
+                    )
+                    _last_groq_call[0] = time.time()
+
                 return resp.choices[0].message.content.strip()
+
             except Exception as e:
                 err = str(e)
+                last_error = e
+
                 # Model decommissioned — invalidate cache and retry once
                 if ("decommissioned" in err or "deprecated" in err) and attempt == 0:
                     _RESOLVED_GROQ_MODEL = None
                     print("[Groq] Model decommissioned — re-resolving")
                     continue
-                last_error = e
+
+                if _is_rate_limited(err):
+                    hint = _retry_after(err)
+                    # A short hint is worth waiting out; anything longer and
+                    # Gemini will answer faster than the budget refills.
+                    if hint and hint <= 20 and attempt < 2:
+                        print(f"[Groq] rate limited — waiting {hint:.1f}s")
+                        time.sleep(hint + 0.5)
+                        continue
+                    print(f"[Groq] rate limited — falling back to Gemini: {err[:120]}")
+                    break
+
                 print(f"[Groq] Attempt {attempt + 1} failed: {err[:120]}")
                 time.sleep(1)
                 break
 
     # ── 2. Gemini ─────────────────────────────────────────────────────────────
     gemini_key = os.getenv("GEMINI_API_KEY")
-    if gemini_key:
+    if not gemini_key:
+        print("[AI] GEMINI_API_KEY not set — no fallback available")
+    else:
         try:
             import google.generativeai as genai
             genai.configure(api_key=gemini_key)
-            model    = genai.GenerativeModel("gemini-2.0-flash")
-            response = model.generate_content(prompt)
+            model = genai.GenerativeModel("gemini-2.0-flash")
+            response = model.generate_content(
+                prompt,
+                generation_config={
+                    "temperature": temperature,
+                    "max_output_tokens": max_tokens,  # Gemini has its own budget
+                },
+            )
             print("[AI] Gemini fallback responded")
             return response.text.strip()
         except Exception as e:
             last_error = e
-            print(f"[Gemini] Failed: {str(e)[:120]}")
+            print(f"[Gemini] Failed: {type(e).__name__}: {str(e)[:200]}")
 
     raise RuntimeError(
-        f"All AI providers failed. Last: {last_error}. "
+        f"All AI providers failed. Last: {type(last_error).__name__}: {last_error}. "
         "Check GROQ_API_KEY and GEMINI_API_KEY in environment."
     )
 
