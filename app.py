@@ -47,7 +47,6 @@ Dependencies:  pip install google-genai   (replaces groq and google-generativeai
 See OPEN SECURITY ITEMS at the foot of this file before shipping to real schools.
 ═══════════════════════════════════════════════════════════════════════════════
 """
-
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -66,7 +65,7 @@ from difflib import SequenceMatcher
 from functools import wraps
 from pathlib import Path
 from flask_cors import cross_origin
-
+import fitz
 
 import requests as http_requests
 
@@ -86,6 +85,8 @@ from google import genai
 from google.genai import types
 
 from tier_limits import check_school_limit, get_db
+from extraction_engine import extract_document
+from firebase_admin import firestore
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("eduket")
@@ -551,16 +552,36 @@ def as_pdf(file_bytes: bytes, filename: str) -> bytes | None:
 # ══════════════════════════════════════════════════════════════════════════════
 # EXTRACTION — one Gemini call per paper
 # ══════════════════════════════════════════════════════════════════════════════
+MIN_CHARS_PER_PAGE = 50
+
+def _extract_pdf_text_local(pdf_bytes: bytes) -> tuple[str, int]:
+    """
+    Free, local text extraction via PyMuPDF. Returns (text, page_count).
+    No network call, no cost, effectively instant.
+    """
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    text = "\n".join(page.get_text() for page in doc)
+    page_count = doc.page_count
+    doc.close()
+    return text.strip(), page_count
+
+
+def _has_usable_text_layer(text: str, page_count: int) -> bool:
+    """
+    Heuristic gate: does this PDF have enough of a real text layer to skip
+    the paid vision call entirely? Too little text per page usually means
+    scanned/photographed pages, so those still need ai_document.
+    """
+    return len(text) >= (MIN_CHARS_PER_PAGE * max(page_count, 1))
+
 
 def extract_exam(file_bytes: bytes, filename: str,
                  subject: str, grade: str) -> tuple[dict, list]:
     """
     Parse a whole exam paper in a single call.
 
-    Returns (paper_meta, questions). questions is a flat, ordered list with
-    section metadata and parent_context already attached to each entry — flat
-    is what the pipeline and the student player expect, and the section fields
-    carry the paper's structure through.
+    Returns (paper_meta, questions) — unchanged shape from the original.
+    Now tries free local text extraction before paying for document vision.
     """
     pdf_bytes = as_pdf(file_bytes, filename)
     if not pdf_bytes:
@@ -569,16 +590,39 @@ def extract_exam(file_bytes: bytes, filename: str,
             "If this is a Word document, confirm LibreOffice is installed."
         )
 
-    result = ai_document(
-        pdf_bytes,
-        "application/pdf",
-        EXTRACTION_PROMPT.format(subject=subject, grade=grade),
-        schema=EXAM_SCHEMA,
-    )
+    prompt = EXTRACTION_PROMPT.format(subject=subject, grade=grade)
 
+    # --- Try free local extraction first ---
+    local_text, page_count = _extract_pdf_text_local(pdf_bytes)
+
+    if _has_usable_text_layer(local_text, page_count):
+        logger.info(
+            "[Extract] %s | local text layer found (%d chars, %d pages) — "
+            "using cheap text call, skipping ai_document",
+            filename, len(local_text), page_count,
+        )
+        # Same schema, same structured output — just text input instead of
+        # raw document bytes. Priced as plain tokens, not vision tokens.
+        result = ai_json(
+            prompt + "\n\n--- EXAM PAPER TEXT ---\n" + local_text,
+            schema=EXAM_SCHEMA,
+        )
+    else:
+        logger.info(
+            "[Extract] %s | insufficient local text (%d chars, %d pages) — "
+            "falling back to ai_document (scanned/image PDF)",
+            filename, len(local_text), page_count,
+        )
+        result = ai_document(
+            pdf_bytes,
+            "application/pdf",
+            prompt,
+            schema=EXAM_SCHEMA,
+        )
+
+    # --- Everything below is unchanged from your original implementation ---
     paper_meta = result.get("metadata") or {}
 
-    # contexts arrive as a list of {group, kind, text} — index them by group
     contexts = {}
     for c in (result.get("contexts") or []):
         group = str(c.get("group", "")).strip()
@@ -597,12 +641,9 @@ def extract_exam(file_bytes: bytes, filename: str,
         for q in (sec.get("questions") or []):
             qnum = str(q.get("question_number") or "").strip()
 
-            # Resolve shared material: explicit reference first, then the
-            # leading number of the question (1.3 -> group "1").
             ref = q.get("context_ref") or (qnum.split(".")[0] if qnum else "")
             parent_context = contexts.get(str(ref), "")
 
-            # options arrive as [{key, value}] — store as a dict in Firestore
             opts = q.get("options")
             options = None
             if isinstance(opts, list) and opts:
@@ -614,24 +655,24 @@ def extract_exam(file_bytes: bytes, filename: str,
                 marks = 1
 
             questions.append({
-                "question_number":      qnum or str(order + 1),
-                "parent_question":      q.get("parent_question", ""),
-                "parent_context":       parent_context,
-                "section":              section_letter,
-                "section_title":        section_title,
+                "question_number": qnum or str(order + 1),
+                "parent_question": q.get("parent_question", ""),
+                "parent_context": parent_context,
+                "section": section_letter,
+                "section_title": section_title,
                 "section_instructions": section_instructions,
-                "instructions":         q.get("instructions") or "",
-                "question":             (q.get("question") or "").strip(),
-                "type":                 (q.get("type") or "open").lower(),
-                "marks":                marks,
-                "options":              options,
-                "column_a":             q.get("column_a"),
-                "column_b":             q.get("column_b"),
-                "table_markdown":       q.get("table_markdown"),
-                "latex":                q.get("latex"),
-                "has_visual":           bool(q.get("has_visual")),
-                "visual_description":   q.get("visual_description"),
-                "order":                order,
+                "instructions": q.get("instructions") or "",
+                "question": (q.get("question") or "").strip(),
+                "type": (q.get("type") or "open").lower(),
+                "marks": marks,
+                "options": options,
+                "column_a": q.get("column_a"),
+                "column_b": q.get("column_b"),
+                "table_markdown": q.get("table_markdown"),
+                "latex": q.get("latex"),
+                "has_visual": bool(q.get("has_visual")),
+                "visual_description": q.get("visual_description"),
+                "order": order,
             })
             order += 1
 
@@ -645,6 +686,9 @@ def extract_exam(file_bytes: bytes, filename: str,
     return paper_meta, questions
 
 
+# ---------------------------------------------------------------------------
+# extract_memo — same signature and return shape as before
+# ---------------------------------------------------------------------------
 def extract_memo(file_bytes: bytes, filename: str, subject: str, grade: str) -> dict:
     """Parse a marking memorandum. Returns {normalised_question_number: answer}."""
     pdf_bytes = as_pdf(file_bytes, filename)
@@ -652,12 +696,33 @@ def extract_memo(file_bytes: bytes, filename: str, subject: str, grade: str) -> 
         logger.warning("[Memo] could not convert %s — skipping", filename)
         return {}
 
-    result = ai_document(
-        pdf_bytes,
-        "application/pdf",
-        MEMO_PROMPT.format(subject=subject, grade=grade),
-        schema=MEMO_SCHEMA,
-    )
+    prompt = MEMO_PROMPT.format(subject=subject, grade=grade)
+
+    # --- Try free local extraction first ---
+    local_text, page_count = _extract_pdf_text_local(pdf_bytes)
+
+    if _has_usable_text_layer(local_text, page_count):
+        logger.info(
+            "[Memo] %s | local text layer found (%d chars, %d pages) — "
+            "using cheap text call, skipping ai_document",
+            filename, len(local_text), page_count,
+        )
+        result = ai_json(
+            prompt + "\n\n--- MEMO TEXT ---\n" + local_text,
+            schema=MEMO_SCHEMA,
+        )
+    else:
+        logger.info(
+            "[Memo] %s | insufficient local text (%d chars, %d pages) — "
+            "falling back to ai_document (scanned/image PDF)",
+            filename, len(local_text), page_count,
+        )
+        result = ai_document(
+            pdf_bytes,
+            "application/pdf",
+            prompt,
+            schema=MEMO_SCHEMA,
+        )
 
     answers = {}
     for row in (result.get("answers") or []):
@@ -2474,6 +2539,24 @@ RULES:
         app.logger.error(f"[AgentChat Error]: {str(e)}")
         return jsonify({'error': 'Failed to process agent chat request', 'details': str(e)}), 500
 
+
+@app.route("/exams/extract", methods=["POST"])
+def extract_exam():
+    file = request.files["file"]
+    file_bytes = file.read()
+
+    result = extract_document(
+        file_bytes=file_bytes,
+        filename=file.filename,
+        prompt="Extract the exam questions and marks as structured JSON.",
+        schema=EXAM_SCHEMA,
+        firestore_client=db,
+    )
+
+    if result is None:
+        return jsonify({"error": "Could not extract content from this file"}), 422
+
+    return jsonify(result)
 
 @app.route("/admin/cleanup-sessions", methods=["POST"])
 @require_admin

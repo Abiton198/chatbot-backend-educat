@@ -74,19 +74,23 @@ import os
 import json
 import uuid
 import shutil
-import logging
 import zipfile
 import tempfile
-import threading
-import subprocess
 from pathlib import Path
 from typing import Optional, Any
-
-import fitz          # PyMuPDF — page rendering only
 import magic         # MIME sniffing for upload validation
 
 from google import genai
 from google.genai import types
+import hashlib
+import logging
+import subprocess
+
+import threading
+from typing import Any
+
+import fitz  # PyMuPDF
+import docx2txt
 
 logger = logging.getLogger(__name__)
 
@@ -102,12 +106,8 @@ MODEL_MARK    = os.getenv("GEMINI_MODEL_MARK",    "gemini-2.5-flash-lite")
 _client: genai.Client | None = None
 _client_lock = threading.Lock()
 
-
 def get_client() -> genai.Client:
-    """
-    Lazy singleton. Built on first use, never at import, so each forked gunicorn
-    worker constructs its own client rather than inheriting one across the fork.
-    """
+    """Lazy singleton, built per Gunicorn worker on first use (post-fork)."""
     global _client
     if _client is None:
         with _client_lock:
@@ -121,19 +121,20 @@ def get_client() -> genai.Client:
 
 
 def _log_usage(resp, label: str):
-    """Real token counts. Estimates drift; the meter does not."""
+    """Real token counts, logged so you can aggregate daily spend from logs."""
     try:
         u = resp.usage_metadata
-        logger.info("[Tokens] %s in=%s out=%s total=%s",
-                    label, u.prompt_token_count, u.candidates_token_count,
-                    u.total_token_count)
+        logger.info(
+            "[Tokens] %s in=%s out=%s total=%s",
+            label, u.prompt_token_count, u.candidates_token_count, u.total_token_count,
+        )
     except Exception:
         pass
 
 
 def ai_text(prompt: str, max_tokens: int = 2000,
             temperature: float = 0.1, model: str | None = None) -> str:
-    """Plain text completion."""
+    """Plain text completion. Cheapest call type — prefer this over ai_document."""
     resp = get_client().models.generate_content(
         model=model or MODEL_EXTRACT,
         contents=prompt,
@@ -148,7 +149,7 @@ def ai_text(prompt: str, max_tokens: int = 2000,
 
 def ai_json(prompt: str, schema: dict, max_tokens: int = 8192,
             temperature: float = 0.0, model: str | None = None) -> Any:
-    """Structured completion — schema-valid by construction, parse directly."""
+    """Structured completion on TEXT you already extracted locally. Cheap."""
     resp = get_client().models.generate_content(
         model=model or MODEL_EXTRACT,
         contents=prompt,
@@ -165,11 +166,11 @@ def ai_json(prompt: str, schema: dict, max_tokens: int = 8192,
 
 def ai_document(pdf_bytes: bytes, prompt: str, schema: dict | None = None,
                 max_tokens: int = 16384, model: str | None = None) -> Any:
-    """Send a PDF straight to the model — layout, tables and figures included."""
-    config = types.GenerateContentConfig(
-        temperature=0.0,
-        max_output_tokens=max_tokens,
-    )
+    """
+    Sends RAW PDF bytes to Gemini (document-vision). Most expensive path
+    per page. Only call this after local extraction + OCR have both failed.
+    """
+    config = types.GenerateContentConfig(temperature=0.0, max_output_tokens=max_tokens)
     if schema:
         config.response_mime_type = "application/json"
         config.response_schema = schema
@@ -184,6 +185,182 @@ def ai_document(pdf_bytes: bytes, prompt: str, schema: dict | None = None,
     )
     _log_usage(resp, "document")
     return json.loads(resp.text) if schema else (resp.text or "").strip()
+
+# =================EXTRACTION LOCCALLY BEFORE AI ATTEMPTS=================
+def extract_text_from_pdf_local(pdf_bytes: bytes) -> tuple[str, int]:
+    """Free PDF text extraction via PyMuPDF. Returns (text, page_count)."""
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    text = "\n".join(page.get_text() for page in doc)
+    page_count = doc.page_count
+    doc.close()
+    return text.strip(), page_count
+
+
+def extract_text_from_docx_local(docx_bytes: bytes) -> str:
+    """Free .docx text extraction via docx2txt."""
+    return docx2txt.process(io.BytesIO(docx_bytes)).strip()
+
+
+def convert_doc_to_docx(doc_bytes: bytes) -> bytes:
+    """
+    Old binary .doc has no clean Python reader, so convert via LibreOffice
+    (free, local subprocess) then read the resulting .docx with docx2txt.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        src_path = os.path.join(tmp, "input.doc")
+        with open(src_path, "wb") as f:
+            f.write(doc_bytes)
+
+        subprocess.run(
+            ["libreoffice", "--headless", "--convert-to", "docx", "--outdir", tmp, src_path],
+            check=True, capture_output=True, timeout=60,
+        )
+
+        out_path = os.path.join(tmp, "input.docx")
+        with open(out_path, "rb") as f:
+            return f.read()
+
+
+def extract_text_from_image_local(image_bytes: bytes) -> str:
+    """
+    Free OCR via Tesseract. Weaker than Gemini vision on messy handwriting,
+    but zero cost — try this before paying for a vision call.
+    Requires: pip install pytesseract pillow --break-system-packages
+              + tesseract-ocr installed at the OS level.
+    """
+    try:
+        import pytesseract
+        from PIL import Image
+        img = Image.open(io.BytesIO(image_bytes))
+        return pytesseract.image_to_string(img).strip()
+    except Exception as e:
+        logger.warning("Local OCR failed: %s", e)
+        return ""
+
+
+def looks_insufficient(text: str, page_count: int = 1, min_chars_per_page: int = 50) -> bool:
+    """
+    Heuristic: too little extracted text per page usually means a scanned
+    image PDF, a corrupted file, or a page that's mostly figures/tables
+    that plain text extraction can't capture. Signals "needs AI fallback".
+    """
+    return len(text.strip()) < (min_chars_per_page * max(page_count, 1))
+
+
+# ---------------------------------------------------------------------------
+# 3. Caching — never pay twice for the same file
+# ---------------------------------------------------------------------------
+
+def file_hash(file_bytes: bytes) -> str:
+    return hashlib.sha256(file_bytes).hexdigest()
+
+
+def get_cached_result(file_bytes: bytes, firestore_client, collection: str = "extractionCache"):
+    """Returns cached extraction result if this exact file was processed before."""
+    h = file_hash(file_bytes)
+    doc = firestore_client.collection(collection).document(h).get()
+    return doc.to_dict()["result"] if doc.exists else None
+
+
+def cache_result(file_bytes: bytes, result: Any, firestore_client,
+                 collection: str = "extractionCache"):
+    """Stores the result keyed by file hash so retries/resubmits are free."""
+    from firebase_admin import firestore  # local import to avoid hard dependency here
+    h = file_hash(file_bytes)
+    firestore_client.collection(collection).document(h).set({
+        "result": result,
+        "createdAt": firestore.SERVER_TIMESTAMP,
+    })
+
+
+# ---------------------------------------------------------------------------
+# 4. The router — this is what app.py should call instead of ai_document()
+# ---------------------------------------------------------------------------
+
+def extract_document(
+        file_bytes: bytes,
+        filename: str,
+        prompt: str,
+        schema: dict | None = None,
+        firestore_client=None,
+) -> Any:
+    """
+    Single entry point for ANY uploaded file. Routes to the cheapest method
+    that will work, only touching the Gemini API as a last resort.
+
+    Order of operations:
+      1. Cache check (if firestore_client provided) -> free
+      2. Local extraction by file type -> free
+      3. If local extraction is insufficient -> AI on the extracted TEXT
+         (ai_json/ai_text — cheap, text tokens only)
+      4. If there's no usable text at all (scanned doc, OCR also failed) ->
+         ai_document with raw bytes (only for PDFs; last resort, priciest path)
+    """
+    # --- Step 1: cache ---
+    if firestore_client is not None:
+        cached = get_cached_result(file_bytes, firestore_client)
+        if cached is not None:
+            logger.info("Cache hit for %s — no API call made", filename)
+            return cached
+
+    ext = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
+    local_text = ""
+    page_count = 1
+    needs_vision_fallback = False  # only PDFs can use ai_document
+
+    # --- Step 2: local extraction by type ---
+    if ext == "pdf":
+        local_text, page_count = extract_text_from_pdf_local(file_bytes)
+        needs_vision_fallback = looks_insufficient(local_text, page_count)
+
+    elif ext == "docx":
+        local_text = extract_text_from_docx_local(file_bytes)
+
+    elif ext == "doc":
+        docx_bytes = convert_doc_to_docx(file_bytes)  # free, local LibreOffice
+        local_text = extract_text_from_docx_local(docx_bytes)
+
+    elif ext in ("txt", "csv", "md"):
+        local_text = file_bytes.decode("utf-8", errors="ignore")
+
+    elif ext in ("jpg", "jpeg", "png"):
+        local_text = extract_text_from_image_local(file_bytes)  # free Tesseract OCR
+        # No raw-bytes vision fallback wired here by default — OCR usually
+        # suffices for typed docs. Only add an image-to-Gemini fallback if
+        # you see OCR consistently failing on real uploads.
+
+    else:
+        logger.warning("Unknown file type '%s' for %s — no local extractor", ext, filename)
+
+    # --- Step 3: cheap AI fallback on TEXT (still avoids ai_document cost) ---
+    if local_text and not needs_vision_fallback:
+        result = (
+            ai_json(prompt + "\n\n---\n" + local_text, schema)
+            if schema
+            else local_text  # no AI call at all if no schema/structuring needed
+        )
+
+    # --- Step 4: last resort — raw document vision call (PDF only) ---
+    elif ext == "pdf" and needs_vision_fallback:
+        logger.info("Local PDF extraction insufficient for %s — falling back to ai_document", filename)
+        result = ai_document(file_bytes, prompt, schema)
+
+    elif not local_text:
+        # Nothing usable extracted and no vision fallback path for this type
+        # (e.g. image OCR came back empty). Log it — don't silently spend money.
+        logger.warning("No usable text for %s and no fallback configured", filename)
+        result = None
+
+    else:
+        # local_text exists but no schema requested — nothing to call AI for
+        result = local_text
+
+    # --- Cache whatever we produced (even local-only results) ---
+    if firestore_client is not None and result is not None:
+        cache_result(file_bytes, result, firestore_client)
+
+    return result
+
 
 def build_memo_prompt(subject: str) -> str:
     return f"""You are parsing the MARKING MEMORANDUM for a {subject} exam.
