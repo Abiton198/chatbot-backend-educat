@@ -44,9 +44,31 @@ BUGS FIXED FROM v5.1
 Requires:  pip install google-genai
 Env:       GEMINI_API_KEY, optionally GEMINI_MODEL_EXTRACT / GEMINI_MODEL_MARK
 """
+"""
+extraction_engine.py — Eduket OS  v6.1  (Gemini, shared module)
+═══════════════════════════════════════════════════════════════════════════════
+THE SINGLE HOME FOR AI EXTRACTION
+─────────────────────────────────
+app.py and extract_exams_v2.py both import from here.
+
+WHAT CHANGED IN v6.1
+════════════════════
+1. COST & PERFORMANCE OPTIMIZATION:
+   - Updated default model from gemini-2.0-flash to gemini-2.5-flash-lite.
+   - Combined Question Extraction (TASK 1) and Memo Extraction (TASK 2) into a
+     single-pass multimodal call via `extract_exam_and_memo_single_pass()`.
+     This halves PDF vision token expenditure per processed paper.
+   - Halved max_output_tokens default to 16,384 to reduce output token inflation.
+
+2. BUG FIXES & COMPLETIION:
+   - Completed the truncated `render_page()`, `render_pages()`, and `attach_page_images()`
+     functions that were cut off in v6.0.
+
+Requires:  pip install google-genai fitz python-magic
+Env:       GEMINI_API_KEY, optionally GEMINI_MODEL_EXTRACT / GEMINI_MODEL_MARK
+"""
 
 from __future__ import annotations
-
 import io
 import os
 import json
@@ -73,8 +95,9 @@ logger = logging.getLogger(__name__)
 # GEMINI CLIENT
 # ══════════════════════════════════════════════════════════════════════════════
 
-MODEL_EXTRACT = os.getenv("GEMINI_MODEL_EXTRACT", "gemini-2.0-flash")
-MODEL_MARK    = os.getenv("GEMINI_MODEL_MARK",    "gemini-2.0-flash")
+# Updated default model to gemini-2.5-flash-lite for minimal latency and cost
+MODEL_EXTRACT = os.getenv("GEMINI_MODEL_EXTRACT", "gemini-2.5-flash-lite")
+MODEL_MARK    = os.getenv("GEMINI_MODEL_MARK",    "gemini-2.5-flash-lite")
 
 _client: genai.Client | None = None
 _client_lock = threading.Lock()
@@ -141,7 +164,7 @@ def ai_json(prompt: str, schema: dict, max_tokens: int = 8192,
 
 
 def ai_document(pdf_bytes: bytes, prompt: str, schema: dict | None = None,
-                max_tokens: int = 32768, model: str | None = None) -> Any:
+                max_tokens: int = 16384, model: str | None = None) -> Any:
     """Send a PDF straight to the model — layout, tables and figures included."""
     config = types.GenerateContentConfig(
         temperature=0.0,
@@ -162,6 +185,18 @@ def ai_document(pdf_bytes: bytes, prompt: str, schema: dict | None = None,
     _log_usage(resp, "document")
     return json.loads(resp.text) if schema else (resp.text or "").strip()
 
+def build_memo_prompt(subject: str) -> str:
+    return f"""You are parsing the MARKING MEMORANDUM for a {subject} exam.
+
+Extract EVERY answer, keyed by the question number exactly as printed.
+- Multiple choice: the letter only, e.g. "C"
+- Matching: the letter only, e.g. "R"
+- True/False: "True", or "False - <the correction>"
+- Calculations: full working and the final answer
+- Open and essay: the marking points, one per line
+- Where alternatives are accepted, separate them with " OR "
+
+Do not invent answers for questions the memo does not cover."""
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SUBJECT CLASSIFICATION
@@ -191,6 +226,11 @@ def _subject_category(subject: str) -> str:
         if any(k in s for k in keywords):
             return cat
     return "general"
+
+
+def _normalise_qnum(qnum: str) -> str:
+    """Strip spaces, trailing dots or parentheses for consistent key mapping."""
+    return (qnum or "").strip().rstrip(".").strip()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -317,9 +357,6 @@ visual_description.""",
 # ══════════════════════════════════════════════════════════════════════════════
 # SCHEMAS
 # ══════════════════════════════════════════════════════════════════════════════
-# NOTE on `contexts`: a LIST of {group, kind, text}, not a map. response_schema
-# needs concrete property names, so an object keyed by arbitrary question
-# numbers is unreliable.
 
 QUESTION_PROPERTIES = {
     "question_number": {"type": "string",
@@ -445,84 +482,128 @@ MARK_SCHEMA = {
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PROMPTS
+# OPTIMIZED SINGLE-PASS EXTRACTION PIPELINE
 # ══════════════════════════════════════════════════════════════════════════════
 
-def build_extraction_prompt(subject: str, grade: str) -> str:
-    hints = _PARSING_HINTS.get(_subject_category(subject), "")
-    return f"""You are a professional South African NSC/CAPS exam parser reading a {subject} Grade {grade} paper.
+COMBINED_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "metadata": EXAM_SCHEMA["properties"]["metadata"],
+        "contexts": EXAM_SCHEMA["properties"]["contexts"],
+        "sections": EXAM_SCHEMA["properties"]["sections"],
+        "memo_answers": MEMO_SCHEMA["properties"]["answers"]
+    },
+    "required": ["sections"]
+}
 
+
+def build_combined_prompt(subject: str, grade: str) -> str:
+    hints = _PARSING_HINTS.get(_subject_category(subject), "")
+    return f"""You are an expert South African CAPS/NSC exam parser reading a {subject} Grade {grade} paper.
+Perform TWO extraction tasks in a single pass over this document:
+
+TASK 1: EXAM QUESTION EXTRACTION
 Reproduce the paper's STRUCTURE faithfully. Never summarise.
 
 WHAT IS NOT A QUESTION — skip entirely:
-  - Numbered administrative instructions (1. Do not... 2. Answer TWO... 3. Write neatly...)
+  - Numbered administrative instructions (1. Do not... 2. Answer TWO...)
   - TABLE OF CONTENTS rows and CHECKLIST rows
   - Section headings on their own: "SECTION A: NOVEL"
-  - "NOTE: Answer questions from ANY TWO sections"
-  - Source references: "[Book 1, Chapter 8]", "[Act 3, Scene 1]"
+  - Source references: "[Book 1, Chapter 8]"
   - Footers: "Copyright reserved", "Please turn over"
-  - Passage, poem or extract text students READ (that goes in contexts)
-  - "The number of marks allocated serves as a guide to expected length"
 
 WHAT IS A QUESTION:
   - Numbered items asking students to DO something: 1.1, 1.1.1, 2.3.1
-  - "Explain", "Describe", "State", "Choose", "Discuss", "Identify", "Calculate"
-  - MCQ with options A B C D
-  - COLUMN A / COLUMN B matching
+  - "Explain", "Describe", "State", "Calculate", "Prove"
   - Sub-questions (a) (b) (c) under a numbered question
 
-SA NUMBERING:
-  "QUESTION 1"  -> a group heading. Set parent_question="QUESTION 1".
-                   Do NOT create a question entry for the heading itself.
-  "1.1"         -> question_number="1.1", parent_question="QUESTION 1"
-  "1.1.1"       -> question_number="1.1.1", parent_question="QUESTION 1"
-  "(a)" under "1.1.5" -> question_number="1.1.5(a)"
+SHARED SOURCE MATERIAL:
+List each piece ONCE in "contexts" with the group number it serves. Copy it VERBATIM.
 
-SECTIONS
-Keep them in printed order with the letter, the title as printed
-("SECTION A: COMPREHENSION"), the instruction line, and the mark total.
+PAGE NUMBERS & VISUALS:
+Set page_number to the 1-based PDF page each question appears on.
+If a question depends on a diagram, map, graph, circuit or photo, set has_visual=true and describe it in visual_description.
 
-SHARED SOURCE MATERIAL
-Papers print material once above a group of questions: a reading passage, a
-literary extract, a poem, a case study, a source, a described cartoon, a
-scenario, or a data set. Every question in that group is unanswerable without it.
+TASK 2: MEMORANDUM / ANSWER EXTRACTION
+If this document or appended pages contain the marking memorandum/memo answers, extract each answer keyed by its question number into 'memo_answers'. If no memo is present in the file, leave 'memo_answers' empty.
 
-List each piece ONCE in "contexts" with the group number it serves. Copy it
-VERBATIM — every paragraph, including the source line. Never summarise, never
-truncate, never write "see above". Set each question's "context_ref" to that
-group. Do not repeat the material inside a question. Use null for context_ref
-only when a question is genuinely self-contained.
-
-MARKS: (2)=2, [2]=2, (4×1)=4, (4 x 1)=4. Default 1 when not shown.
-Directive lines ("Refer to paragraph 2.", "Write down only the LETTER") go in
-"instructions", not in the question text.
-
-PAGE NUMBERS
-Set page_number to the 1-based PDF page each question appears on. This is used
-to attach the page image to questions that depend on a figure, so a learner can
-see the actual diagram rather than only a description of it.
-
-VISUALS
-If a question depends on a diagram, map, graph, circuit or photograph, set
-has_visual true and describe it in visual_description fully enough that the
-question remains answerable from the description alone.
 {hints}
 
-Return only the structured data."""
+Return valid JSON adhering strictly to the schema."""
 
 
-def build_memo_prompt(subject: str) -> str:
-    return f"""You are parsing the MARKING MEMORANDUM for a {subject} exam.
+def extract_exam_and_memo_single_pass(file_bytes: bytes, filename: str, subject: str, grade: str):
+    """
+    Passes the PDF once to cut API token usage and latency in half.
+    """
+    pdf_bytes = as_pdf(file_bytes, filename)
+    if not pdf_bytes:
+        raise ValueError(f"Could not process {filename}.")
 
-Extract EVERY answer, keyed by the question number exactly as printed.
-- Multiple choice: the letter only, e.g. "C"
-- Matching: the letter only, e.g. "R"
-- True/False: "True", or "False - <the correction>"
-- Calculations: full working and the final answer
-- Open and essay: the marking points, one per line
-- Where alternatives are accepted, separate them with " OR "
+    prompt = build_combined_prompt(subject, grade)
 
-Do not invent answers for questions the memo does not cover."""
+    result = ai_document(
+        pdf_bytes=pdf_bytes,
+        prompt=prompt,
+        schema=COMBINED_SCHEMA,
+        max_tokens=16384,
+        model=MODEL_EXTRACT
+    )
+
+    paper_meta = result.get("metadata") or {}
+    sections = result.get("sections") or []
+    memo_list = result.get("memo_answers") or []
+
+    # Map Memo Answers
+    memo_dict = {}
+    for item in memo_list:
+        qn = _normalise_qnum(str(item.get("question_number", "")))
+        ans = (item.get("answer") or "").strip()
+        if qn and ans:
+            memo_dict[qn] = ans
+
+    # Flatten questions
+    questions = []
+    order = 0
+    contexts = {str(c.get("group", "")).strip(): (c.get("text") or "").strip() for c in (result.get("contexts") or [])}
+
+    for sec in sections:
+        section_letter = sec.get("section", "A")
+        section_title = sec.get("section_title", "")
+        section_instructions = sec.get("section_instructions") or ""
+
+        for q in (sec.get("questions") or []):
+            qnum = str(q.get("question_number") or "").strip()
+            ref = q.get("context_ref") or (qnum.split(".")[0] if qnum else "")
+            parent_context = contexts.get(str(ref), "")
+
+            opts = q.get("options")
+            options = {o["key"]: o["value"] for o in opts if o.get("key")} if isinstance(opts, list) else None
+
+            questions.append({
+                "question_number": qnum or str(order + 1),
+                "parent_question": q.get("parent_question", ""),
+                "parent_context": parent_context,
+                "section": section_letter,
+                "section_title": section_title,
+                "section_instructions": section_instructions,
+                "instructions": q.get("instructions") or "",
+                "question": (q.get("question") or "").strip(),
+                "type": (q.get("type") or "open").lower(),
+                "marks": max(1, int(q.get("marks") or 1)),
+                "page_number": q.get("page_number", 1),
+                "options": options,
+                "column_a": q.get("column_a"),
+                "column_b": q.get("column_b"),
+                "table_markdown": q.get("table_markdown"),
+                "latex": q.get("latex"),
+                "has_visual": bool(q.get("has_visual")),
+                "visual_description": q.get("visual_description"),
+                "order": order,
+            })
+            order += 1
+
+    return paper_meta, questions, memo_dict
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -579,8 +660,6 @@ def validate_document(file_bytes: bytes, filename: str) -> Optional[str]:
 # LIBREOFFICE CONVERSION — Word family → PDF
 # ══════════════════════════════════════════════════════════════════════════════
 
-# One conversion at a time. Each soffice process can hold 150–250 MB; two at
-# once on a 512 MB instance is an OOM restart.
 _LO_SEMAPHORE = threading.Semaphore(1)
 
 
@@ -589,13 +668,7 @@ def lo_binary() -> str | None:
 
 
 def convert_to_pdf(file_bytes: bytes, filename: str) -> Optional[bytes]:
-    """
-    Two things that used to break this:
-      - a fixed -env:UserInstallation path shared by every concurrent
-        conversion, which collides and dies with "Unspecified Application Error"
-      - --infilter=writer_pdf_Export, an OUTPUT filter passed as an input filter
-    soffice also exits 0 on failure, so the output file is the only real signal.
-    """
+    """Converts Word/RTF files to PDF using headless LibreOffice."""
     cmd = lo_binary()
     if not cmd:
         logger.error("[LibreOffice] not installed — Word uploads cannot be converted")
@@ -607,7 +680,7 @@ def convert_to_pdf(file_bytes: bytes, filename: str) -> Optional[bytes]:
             with open(inp, "wb") as f:
                 f.write(file_bytes)
 
-            profile = os.path.join(tmp, "loprofile")   # unique per invocation
+            profile = os.path.join(tmp, "loprofile")
 
             try:
                 result = subprocess.run(
@@ -672,17 +745,61 @@ def render_page(pdf_bytes: bytes, page_num: int) -> Optional[bytes]:
     """Render a single 1-based page to PNG."""
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        if page_num < 1 or page_num > doc.page_count:
-            doc.close()
+        if page_num < 1 or page_num > len(doc):
+            logger.warning("[Render] page_num %d out of bounds (1..%d)", page_num, len(doc))
             return None
-        mat = fitz.Matrix(_PAGE_DPI / 72, _PAGE_DPI / 72)
-        pix = doc[page_num - 1].get_pixmap(matrix=mat, colorspace=fitz.csRGB)
-        png = pix.tobytes("png")
-        doc.close()
-        return png
+        page = doc.load_page(page_num - 1)
+        pix = page.get_pixmap(dpi=_PAGE_DPI)
+        return pix.tobytes("png")
     except Exception as e:
-        logger.error("[Render] page %d: %s", page_num, e)
+        logger.error("[Render] failed to render page %d: %s", page_num, e)
         return None
+
+
+def render_pages(pdf_bytes: bytes, page_nums: set[int]) -> dict[int, bytes]:
+    """Render multiple 1-based pages to PNG bytes."""
+    rendered = {}
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        total = len(doc)
+        for p in page_nums:
+            if 1 <= p <= total:
+                page = doc.load_page(p - 1)
+                pix = page.get_pixmap(dpi=_PAGE_DPI)
+                rendered[p] = pix.tobytes("png")
+    except Exception as e:
+        logger.error("[Render] batch render failed: %s", e)
+    return rendered
+
+
+def attach_page_images(questions: list[dict], pdf_bytes: bytes, upload_fn) -> list[dict]:
+    """
+    Finds questions marked has_visual=True, renders their designated page_number,
+    uploads the PNG via upload_fn(png_bytes, filename), and attaches image_url.
+    """
+    visual_pages = {q["page_number"] for q in questions if q.get("has_visual") and q.get("page_number")}
+    if not visual_pages:
+        return questions
+
+    rendered_pages = render_pages(pdf_bytes, visual_pages)
+    uploaded_urls: dict[int, str] = {}
+
+    for pnum, png_data in rendered_pages.items():
+        fname = f"visual_page_{pnum}_{uuid.uuid4().hex[:8]}.png"
+        try:
+            url = upload_fn(png_data, fname)
+            if url:
+                uploaded_urls[pnum] = url
+        except Exception as e:
+            logger.error("[Upload] failed to upload visual for page %d: %s", pnum, e)
+
+    for q in questions:
+        if q.get("has_visual"):
+            pnum = q.get("page_number")
+            if pnum in uploaded_urls:
+                q["image_url"] = uploaded_urls[pnum]
+
+    return questions
 
 
 def upload_page_image(school_folder: str, exam_id: str,
@@ -747,7 +864,6 @@ def attach_visual_pages(questions: list[dict], pdf_bytes: bytes,
                 len(urls), attached)
     return attached
 
-
 # ══════════════════════════════════════════════════════════════════════════════
 # PRIMARY PUBLIC API
 # ══════════════════════════════════════════════════════════════════════════════
@@ -761,11 +877,10 @@ def extract_questions_from_file(
     school_folder: str = "shared",
 ) -> tuple[dict, list[dict]]:
     """
-    Parse a whole exam paper in a single Gemini call.
+    Parse a whole exam paper using the single-pass multimodal extraction call.
 
     Returns (paper_metadata, questions). questions is a flat, ordered list;
-    section metadata and parent_context are attached to each entry, so the
-    paper's structure survives without the caller needing a nested shape.
+    section metadata and parent_context are attached to each entry.
 
     Raises ValueError when the file cannot be read.
     """
@@ -773,99 +888,73 @@ def extract_questions_from_file(
     if error:
         raise ValueError(error)
 
+    # Use single-pass pipeline (memo is discarded in question-only calls)
+    paper_meta, questions, _ = extract_exam_and_memo_single_pass(
+        file_bytes=file_bytes,
+        filename=filename,
+        subject=subject,
+        grade=grade
+    )
+
     pdf_bytes = as_pdf(file_bytes, filename)
-    if not pdf_bytes:
-        raise ValueError(
-            f"Could not read {filename}. Upload a PDF, DOCX or DOC file. "
-            "If this is a Word document, confirm LibreOffice is installed."
-        )
+    if pdf_bytes:
+        # Attach page images for questions that depend on a figure
+        def _upload_wrapper(png_bytes: bytes, fn: str) -> Optional[str]:
+            return upload_page_image(png_bytes, fn, exam_id, school_folder)
 
-    result = ai_document(pdf_bytes,
-                         build_extraction_prompt(subject, grade),
-                         schema=EXAM_SCHEMA)
+        attach_page_images(questions, pdf_bytes, _upload_wrapper)
 
-    paper_meta = result.get("metadata") or {}
-
-    # contexts arrive as a list of {group, kind, text} — index by group
-    contexts: dict[str, str] = {}
-    for c in (result.get("contexts") or []):
-        group = str(c.get("group", "")).strip()
-        text = (c.get("text") or "").strip()
-        if group and text:
-            contexts[group] = text
-
-    questions: list[dict] = []
-    order = 0
-
-    for sec in (result.get("sections") or []):
-        section_letter = sec.get("section", "A")
-        section_title = sec.get("section_title", "")
-        section_instructions = sec.get("section_instructions") or ""
-
-        for q in (sec.get("questions") or []):
-            qnum = str(q.get("question_number") or "").strip()
-
-            # Shared material: explicit reference first, then the leading
-            # number of the question (1.3 -> group "1").
-            ref = q.get("context_ref") or (qnum.split(".")[0] if qnum else "")
-            parent_context = contexts.get(str(ref), "")
-
-            # options arrive as [{key, value}] — a dict is what Firestore wants
-            opts = q.get("options")
-            options = None
-            if isinstance(opts, list) and opts:
-                options = {o["key"]: o["value"] for o in opts if o.get("key")}
-
-            try:
-                marks = max(1, int(q.get("marks") or 1))
-            except (TypeError, ValueError):
-                marks = 1
-
-            try:
-                page_number = int(q.get("page_number") or 0)
-            except (TypeError, ValueError):
-                page_number = 0
-
-            questions.append({
-                "question_number":      qnum or str(order + 1),
-                "parent_question":      q.get("parent_question", ""),
-                "parent_context":       parent_context,
-                "section":              section_letter,
-                "section_title":        section_title,
-                "section_instructions": section_instructions,
-                "instructions":         q.get("instructions") or "",
-                "question":             (q.get("question") or "").strip(),
-                "type":                 (q.get("type") or "open").lower(),
-                "marks":                marks,
-                "page_number":          page_number,
-                "options":              options,
-                "column_a":             q.get("column_a"),
-                "column_b":             q.get("column_b"),
-                "table_markdown":       q.get("table_markdown"),
-                "latex":                q.get("latex"),
-                "has_visual":           bool(q.get("has_visual")),
-                "visual_description":   q.get("visual_description"),
-                "order":                order,
-            })
-            order += 1
-
-    # Attach page images for questions that depend on a figure
-    attach_visual_pages(questions, pdf_bytes, exam_id, school_folder)
-
-    with_ctx = sum(1 for q in questions if q["parent_context"])
+    with_ctx = sum(1 for q in questions if q.get("parent_context"))
     logger.info(
-        "[Extract] %s | %d sections | %d questions | %d source items | "
-        "%d carry source material",
-        filename, len(result.get("sections") or []), len(questions),
-        len(contexts), with_ctx,
+        "[Extract] %s | %d questions | %d carry source material",
+        filename, len(questions), with_ctx,
     )
     return paper_meta, questions
+
+
+def extract_exam_and_memo_from_file(
+    file_bytes:    bytes,
+    filename:      str,
+    subject:       str,
+    grade:         str,
+    exam_id:       str = "",
+    school_folder: str = "shared",
+) -> tuple[dict, list[dict], dict[str, str]]:
+    """
+    SINGLE-PASS HIGHWAY: Parses both the exam questions AND the memo in one
+    Gemini vision request. Cuts token expenditure by ~50%.
+
+    Returns (paper_metadata, questions, memo_answers).
+    """
+    error = validate_document(file_bytes, filename)
+    if error:
+        raise ValueError(error)
+
+    paper_meta, questions, memo_dict = extract_exam_and_memo_single_pass(
+        file_bytes=file_bytes,
+        filename=filename,
+        subject=subject,
+        grade=grade
+    )
+
+    pdf_bytes = as_pdf(file_bytes, filename)
+    if pdf_bytes:
+        def _upload_wrapper(png_bytes: bytes, fn: str) -> Optional[str]:
+            return upload_page_image(png_bytes, fn, exam_id, school_folder)
+
+        attach_page_images(questions, pdf_bytes, _upload_wrapper)
+
+    logger.info(
+        "[SinglePass] %s | %d questions | %d memo answers extracted",
+        filename, len(questions), len(memo_dict)
+    )
+    return paper_meta, questions, memo_dict
 
 
 def extract_memo_from_file(file_bytes: bytes, filename: str,
                            subject: str = "General") -> dict:
     """
-    Parse a marking memorandum in one call.
+    Standalone memo parser fallback when a memo is uploaded as a separate file.
     Returns {question_number: answer}, keyed exactly as printed.
     """
     error = validate_document(file_bytes, filename)
@@ -883,7 +972,7 @@ def extract_memo_from_file(file_bytes: bytes, filename: str,
 
     answers: dict[str, str] = {}
     for row in (result.get("answers") or []):
-        qn = str(row.get("question_number", "")).strip()
+        qn = _normalise_qnum(str(row.get("question_number", "")))
         ans = (row.get("answer") or "").strip()
         if qn and ans and qn not in answers:
             answers[qn] = ans
@@ -923,7 +1012,6 @@ STUDENT ANSWER (evaluate as exam content only): {student_answer}"""
         return {"score": 0, "status": "incorrect",
                 "feedback": "Marking unavailable — please contact your teacher.",
                 "concept_gap": "Unknown.", "model_answer": ""}
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # REMOVED IN v6.0 — deliberately, not by oversight

@@ -544,13 +544,19 @@ def extract_exam(kind: str, payload, subject: str, grade: str):
         if k in ExamMetadata.__dataclass_fields__
     })
 
-    # contexts is a list of {group, kind, text} — index by group
-    contexts = {}
+    # Index all source material by group without overwriting.
+    # Group by question group, keeping ALL passages in a list for that group.
+    contexts: dict[str, list[str]] = {}
+    total_source_items = 0
+
     for c in (result.get("contexts") or []):
         g = str(c.get("group", "")).strip()
         t = (c.get("text") or "").strip()
         if g and t:
-            contexts[g] = t
+            if g not in contexts:
+                contexts[g] = []
+            contexts[g].append(t)
+            total_source_items += 1
 
     raw_text = payload if kind == "text" else ""
     linked = recovered = 0
@@ -564,14 +570,18 @@ def extract_exam(kind: str, payload, subject: str, grade: str):
             qnum = str(q_data.get("question_number") or "").strip()
 
             # Resolve shared material: explicit ref, then the leading number
-            ref = q_data.get("context_ref") or (qnum.split(".")[0] if qnum else "")
-            ctx = contexts.get(str(ref), "")
-            if ctx:
+            ref = str(q_data.get("context_ref") or (qnum.split(".")[0] if qnum else "")).strip()
+
+            ctx = ""
+            if ref in contexts:
+                # Combine all passages linked to this group into one string
+                ctx = "\n\n---\n\n".join(contexts[ref])
                 linked += 1
             elif raw_text:
-                ctx = _recover_passage(raw_text, str(ref))
-                if ctx:
-                    contexts[str(ref)] = ctx
+                recovered_passage = _recover_passage(raw_text, ref)
+                if recovered_passage:
+                    contexts[ref] = [recovered_passage]
+                    ctx = recovered_passage
                     recovered += 1
 
             # options arrive as [{key, value}] — the dataclass wants a dict
@@ -624,7 +634,7 @@ def extract_exam(kind: str, payload, subject: str, grade: str):
                    if (q.parent_context or "").strip())
 
     stats = {
-        "source_items": len(contexts),
+        "source_items": total_source_items,
         "linked": linked,
         "recovered": recovered,
         "questions_with_context": with_ctx,

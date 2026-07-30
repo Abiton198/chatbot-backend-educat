@@ -95,12 +95,11 @@ logger = logging.getLogger("eduket")
 # GEMINI CLIENT
 # ══════════════════════════════════════════════════════════════════════════════
 
-MODEL_EXTRACT = os.getenv("GEMINI_MODEL_EXTRACT", "gemini-3.6-flash")
-MODEL_MARK    = os.getenv("GEMINI_MODEL_MARK",    "gemini-3.6-flash")
+MODEL_EXTRACT = os.getenv("GEMINI_MODEL_EXTRACT", "gemini-3.1-flash-lite")
+MODEL_MARK    = os.getenv("GEMINI_MODEL_MARK",    "gemini-3.1-flash-lite")
 
 _genai_client: genai.Client | None = None
 _genai_lock = threading.Lock()
-
 
 def get_genai() -> genai.Client:
     """
