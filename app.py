@@ -65,6 +65,8 @@ from datetime import datetime, timezone, timedelta
 from difflib import SequenceMatcher
 from functools import wraps
 from pathlib import Path
+from flask_cors import cross_origin
+
 
 import requests as http_requests
 
@@ -2357,6 +2359,96 @@ def trigger_extract(exam_id):
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
+
+@app.route('/agent-chat', methods=['POST', 'OPTIONS'])
+@cross_origin()
+def agent_chat():
+    if request.method == 'OPTIONS':
+        return '', 200
+
+    try:
+        data = request.get_json() or {}
+        student_id = data.get('student_id')
+        user_message = data.get('message', '').strip()
+        chat_history = data.get('history',
+                                [])  # Optional array of previous messages [{role: 'user'|'model', text: '...'}]
+
+        if not student_id or not user_message:
+            return jsonify({'error': 'Missing student_id or message'}), 400
+
+        # 1. Fetch Student Profile & Exam History from Firestore
+        student_doc = db.collection('users').document(student_id).get()
+        student_info = student_doc.to_dict() if student_doc.exists else {}
+        student_name = student_info.get('displayName', 'Student')
+
+        results_ref = db.collection('submissions').where('studentId', '==', student_id).limit(10)
+        history_summary = []
+        for doc in results_ref.stream():
+            res = doc.to_dict()
+            subject = res.get('subject', 'General')
+            score = res.get('score', res.get('totalScore', 'N/A'))
+            percentage = res.get('percentage', 'N/A')
+            history_summary.append(f"- Subject: {subject} | Score: {score} ({percentage}%)")
+
+        performance_context = "\n".join(
+            history_summary) if history_summary else "No previous exam performance records found."
+
+        # 2. Construct System Instructions
+        system_instructions = f"""
+You are AI Mentor, an empathetic Socratic academic tutor for {student_name}.
+
+---
+STUDENT PERFORMANCE HISTORY:
+{performance_context}
+---
+
+PEDAGOGICAL GOALS:
+Do NOT give away the final answer immediately. Guide {student_name} step-by-step.
+
+RULES:
+1. Probe with ONE targeted sub-question or hint at a time to lead them to the next logical step.
+2. If they make a mistake, acknowledge what they got right, correct the misconception gently, and ask a simpler guiding question.
+3. Reference their past exam performance where relevant to boost confidence or address known weak spots.
+4. When they arrive at the final correct answer, praise them warmly and summarize key takeaways.
+5. Keep turns short, engaging, and conversational (under 4 sentences).
+"""
+
+        # 3. Format contents with system context + chat history
+        contents = [
+            {"role": "user", "parts": [{"text": system_instructions}]},
+            {"role": "model", "parts": [{"text": f"Understood! Ready to guide {student_name} step-by-step."}]}
+        ]
+
+        # Append turn-by-turn history passed from frontend
+        for msg in chat_history:
+            role = "user" if msg.get("sender") == "user" or msg.get("role") == "user" else "model"
+            contents.append({
+                "role": role,
+                "parts": [{"text": msg.get("text", msg.get("message", ""))}]
+            })
+
+        # Append current message
+        contents.append({"role": "user", "parts": [{"text": user_message}]})
+
+        # 4. Generate Content via Gemini SDK
+        MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+
+        response = get_genai().models.generate_content(
+            model=MODEL_NAME,
+            contents=contents
+        )
+
+        reply_text = response.text if hasattr(response,
+                                              'text') else "Let's take a look at this together—what is the first step you think we should take?"
+
+        return jsonify({
+            'response': reply_text,
+            'student_id': student_id
+        }), 200
+
+    except Exception as e:
+        app.logger.error(f"[AgentChat Error]: {str(e)}")
+        return jsonify({'error': 'Failed to process agent chat request', 'details': str(e)}), 500
 
 @app.route("/admin/cleanup-sessions", methods=["POST"])
 @require_admin
