@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 extraction_engine.py — Eduket OS  v6.0  (Gemini, shared module)
 ═══════════════════════════════════════════════════════════════════════════════
@@ -68,7 +69,6 @@ Requires:  pip install google-genai fitz python-magic
 Env:       GEMINI_API_KEY, optionally GEMINI_MODEL_EXTRACT / GEMINI_MODEL_MARK
 """
 
-from __future__ import annotations
 import io
 import os
 import json
