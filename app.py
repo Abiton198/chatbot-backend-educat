@@ -2369,35 +2369,55 @@ def agent_chat():
         data = request.get_json() or {}
         student_id = data.get('student_id')
         user_message = data.get('message', '').strip()
-        chat_history = data.get('history',
-                                [])  # Optional array of previous messages [{role: 'user'|'model', text: '...'}]
+        chat_history = data.get('history', [])
 
         if not student_id or not user_message:
             return jsonify({'error': 'Missing student_id or message'}), 400
 
-        # 1. Fetch Student Profile & Exam History from Firestore
+        # 1. Fetch Student Profile & Detailed Exam History from Firestore
         student_doc = db.collection('users').document(student_id).get()
         student_info = student_doc.to_dict() if student_doc.exists else {}
         student_name = student_info.get('displayName', 'Student')
 
-        results_ref = db.collection('submissions').where('studentId', '==', student_id).limit(10)
+        # Fetch up to 10 recent submissions ordered by timestamp if available
+        submissions_ref = (
+            db.collection('submissions')
+            .where('studentId', '==', student_id)
+            .limit(10)
+        )
+
         history_summary = []
-        for doc in results_ref.stream():
+        for doc in submissions_ref.stream():
             res = doc.to_dict()
             subject = res.get('subject', 'General')
+            exam_title = res.get('examTitle', res.get('title', 'Exam'))
             score = res.get('score', res.get('totalScore', 'N/A'))
             percentage = res.get('percentage', 'N/A')
-            history_summary.append(f"- Subject: {subject} | Score: {score} ({percentage}%)")
+            date_str = res.get('submittedAt', res.get('createdAt', ''))
 
-        performance_context = "\n".join(
-            history_summary) if history_summary else "No previous exam performance records found."
+            # Extract detailed topic/concept gaps if present in the submission
+            concept_gaps = res.get('concept_gaps', [])
+            if isinstance(concept_gaps, list) and concept_gaps:
+                gaps_str = f" | Weak areas: {', '.join(concept_gaps)}"
+            else:
+                gaps_str = ""
 
-        # 2. Construct System Instructions
+            history_summary.append(
+                f"- [{subject}] {exam_title}: Score {score} ({percentage}%){gaps_str}"
+            )
+
+        performance_context = (
+            "\n".join(history_summary)
+            if history_summary
+            else "No previous exam performance records found."
+        )
+
+        # 2. Construct System Instructions using the traced performance context
         system_instructions = f"""
 You are AI Mentor, an empathetic Socratic academic tutor for {student_name}.
 
 ---
-STUDENT PERFORMANCE HISTORY:
+STUDENT PERFORMANCE HISTORY & TRACE:
 {performance_context}
 ---
 
@@ -2407,12 +2427,12 @@ Do NOT give away the final answer immediately. Guide {student_name} step-by-step
 RULES:
 1. Probe with ONE targeted sub-question or hint at a time to lead them to the next logical step.
 2. If they make a mistake, acknowledge what they got right, correct the misconception gently, and ask a simpler guiding question.
-3. Reference their past exam performance where relevant to boost confidence or address known weak spots.
+3. Reference their past exam performance and weak spots directly where relevant to boost confidence or provide targeted support.
 4. When they arrive at the final correct answer, praise them warmly and summarize key takeaways.
 5. Keep turns short, engaging, and conversational (under 4 sentences).
 """
 
-        # 3. Format contents with system context + chat history
+        # 3. Build turn-by-turn payload using your exact buildup structure
         contents = [
             {"role": "user", "parts": [{"text": system_instructions}]},
             {"role": "model", "parts": [{"text": f"Understood! Ready to guide {student_name} step-by-step."}]}
@@ -2421,10 +2441,12 @@ RULES:
         # Append turn-by-turn history passed from frontend
         for msg in chat_history:
             role = "user" if msg.get("sender") == "user" or msg.get("role") == "user" else "model"
-            contents.append({
-                "role": role,
-                "parts": [{"text": msg.get("text", msg.get("message", ""))}]
-            })
+            msg_text = msg.get("text", msg.get("message", ""))
+            if msg_text:
+                contents.append({
+                    "role": role,
+                    "parts": [{"text": msg_text}]
+                })
 
         # Append current message
         contents.append({"role": "user", "parts": [{"text": user_message}]})
@@ -2437,8 +2459,11 @@ RULES:
             contents=contents
         )
 
-        reply_text = response.text if hasattr(response,
-                                              'text') else "Let's take a look at this together—what is the first step you think we should take?"
+        reply_text = (
+            response.text
+            if hasattr(response, 'text') and response.text
+            else "Let's take a look at this together—what is the first step you think we should take?"
+        )
 
         return jsonify({
             'response': reply_text,
@@ -2448,6 +2473,7 @@ RULES:
     except Exception as e:
         app.logger.error(f"[AgentChat Error]: {str(e)}")
         return jsonify({'error': 'Failed to process agent chat request', 'details': str(e)}), 500
+
 
 @app.route("/admin/cleanup-sessions", methods=["POST"])
 @require_admin
