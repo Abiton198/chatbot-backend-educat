@@ -84,6 +84,7 @@ from google.genai import types
 
 from tier_limits import check_school_limit, get_db
 from extraction_engine import extract_document
+from extract_exam import extract_exam, extract_memo
 from firebase_admin import firestore
 import traceback
 import threading
@@ -2615,7 +2616,7 @@ RULES:
 
 
 @app.route("/exams/extract", methods=["POST"])
-def extract_exam():
+def api_extract_exam():
     file = request.files["file"]
     file_bytes = file.read()
 
