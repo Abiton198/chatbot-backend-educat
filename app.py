@@ -57,8 +57,6 @@ import uuid
 import shutil
 import logging
 import tempfile
-import threading
-import traceback
 import subprocess
 from datetime import datetime, timezone, timedelta
 from difflib import SequenceMatcher
@@ -87,6 +85,9 @@ from google.genai import types
 from tier_limits import check_school_limit, get_db
 from extraction_engine import extract_document
 from firebase_admin import firestore
+import traceback
+import threading
+import hashlib
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("eduket")
