@@ -1287,14 +1287,19 @@ def _subject_doc_ref(school_id: str, subject_name: str):
               .document(subject_name))
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# PIPELINE IMPLEMENTATION
+# ══════════════════════════════════════════════════════════════════════════════
+
 def run_extraction_pipeline(exam_id: str, meta: dict, school_id: str, subject_name: str):
     """
-    Four stages now that chunking is gone:
-      1. Download the exam file (PDF, DOCX or DOC)
-      2. One Gemini call -> structured paper
-      3. Download and parse the memo, if supplied
-      4. Write exams/{examId} + exam_questions/{examId}_{nnnn}
-    Status: pending_extraction -> processing -> ready | error
+    Four stages:
+      1. Check existing status / hash duplicate to prevent redundant downloads & AI calls
+      2. Download the exam file (PDF, DOCX or DOC)
+      3. Call extract_exam(kind, payload, subject, grade) -> (metadata, sections, stats)
+      4. Download and parse memo, if supplied
+      5. Write exams/{examId} + exam_questions/{examId}_{nnnn}
+    Status transitions: pending_extraction -> processing -> ready | error
     """
     subject_ref = _subject_doc_ref(school_id, subject_name)
 
@@ -1314,19 +1319,23 @@ def run_extraction_pipeline(exam_id: str, meta: dict, school_id: str, subject_na
             logger.warning("[Status] Update failed: %s", e)
 
     try:
+        # Check 1: Skip if this specific exam_id is already marked ready in Firestore
         current = db.collection("exams").document(exam_id).get()
         if current.exists and current.to_dict().get("status") == "ready":
-            logger.info("[Pipeline] %s already ready — skipping", exam_id)
+            logger.info("[Pipeline] %s already ready — skipping extraction", exam_id)
+            set_status("ready")
             return
 
         subject = meta.get("subject", subject_name or "General")
         grade = meta.get("grade", "12")
         title = meta.get("title", "Exam")
         logger.info("[Pipeline] === %s | %s Gr%s", exam_id, subject, grade)
-        set_status("processing",
-                   {"processingStartedAt": datetime.now(timezone.utc).isoformat()})
 
-        # 1. Download
+        set_status("processing", {
+            "processingStartedAt": datetime.now(timezone.utc).isoformat()
+        })
+
+        # 1. Download Exam File
         exam_bytes, exam_fn = download_file_for_extraction(meta, "exam")
         if not exam_bytes:
             raise ValueError("Exam file could not be downloaded from Storage.")
@@ -1337,116 +1346,169 @@ def run_extraction_pipeline(exam_id: str, meta: dict, school_id: str, subject_na
                 f"Unsupported file type '{ext}'. Upload a PDF, DOCX or DOC file."
             )
 
-        # 2. Extract — one call, whole paper
-        # paper_meta, questions = extract_exam(exam_bytes, exam_fn, subject, grade)
-        # Determine whether to pass "document" or "text"
-        kind = "document"  # or "text" if pre-extracted
+        # Check 2: Deduplication via Content Hash
+        # Generate MD5 hash of raw file bytes to check if this exact file was processed before
+        file_hash = hashlib.md5(exam_bytes).hexdigest()
+        existing_matches = (
+            db.collection("exams")
+            .where("fileHash", "==", file_hash)
+            .where("status", "==", "ready")
+            .limit(1)
+            .get()
+        )
+
+        if existing_matches:
+            match_doc = existing_matches[0].to_dict()
+            logger.info(
+                "[Pipeline] Duplicate file detected (Hash %s matching exam %s) — skipping AI extraction",
+                file_hash, existing_matches[0].id
+            )
+            # Copy extracted data from the existing exam record directly
+            db.collection("exams").document(exam_id).set({
+                **match_doc,
+                "title": title,
+                "schoolId": meta.get("schoolId", school_id),
+                "uploadedBy": meta.get("uploadedBy", ""),
+                "uploadedAt": meta.get("uploadedAt", ""),
+                "sourceUploadId": exam_id,
+                "fileHash": file_hash,
+                "duplicatedFrom": existing_matches[0].id,
+                "extractedAt": fs_admin.SERVER_TIMESTAMP,
+            }, merge=True)
+
+            set_status("ready", {"duplicatedFrom": existing_matches[0].id})
+            return
+
+        # 2. Extract Paper via Gemini — Correct parameters (kind, payload, subject, grade)
+        kind = "document"  # "document" for PDF bytes or "text" for plain text
         payload = exam_bytes
 
-        # Call extract_exam with the expected arguments
+        # Correctly unpack the 3 return values from extract_exam
         metadata, sections, stats = extract_exam(kind, payload, subject, grade)
 
-        # Flatten questions if app.py expects a flat list of questions
+        # Flatten questions from sections to match internal schema
         questions = [q for sec in sections for q in sec.questions]
-        paper_meta = metadata.__dict__ if hasattr(metadata, '__dict__') else metadata
+        paper_meta = metadata.__dict__ if hasattr(metadata, "__dict__") else metadata
+
         if not questions:
             raise ValueError(
                 "No questions were found. Confirm the file is a complete exam paper."
             )
 
-        with_ctx = sum(1 for q in questions if q.get("parent_context"))
-        logger.info("[Pipeline] %d questions | %d carry source material",
-                    len(questions), with_ctx)
+        with_ctx = sum(1 for q in questions if
+                       (getattr(q, "parent_context", None) or (isinstance(q, dict) and q.get("parent_context"))))
+        logger.info(
+            "[Pipeline] %d questions extracted | %d carry source material",
+            len(questions), with_ctx
+        )
 
-        # 3. Memo
+        # 3. Process Memo (if provided)
         memo_map: dict = {}
         if not meta.get("aiMarkingOnly"):
             memo_bytes, memo_fn = download_file_for_extraction(meta, "memo")
             if memo_bytes and Path(memo_fn).suffix.lower() in ALLOWED_EXTS:
                 memo_map = extract_memo(memo_bytes, memo_fn, subject, grade)
 
+        # Attach memo answers to questions
         for q in questions:
-            qn = _normalise_qnum(q.get("question_number", ""))
-            if qn and qn in memo_map and not q.get("memo"):
-                q["memo"] = memo_map[qn]
+            # Handle both dataclass instances and dictionaries
+            q_num = q.question_number if hasattr(q, "question_number") else q.get("question_number", "")
+            qn = _normalise_qnum(q_num)
 
-        # 4a. Top-level exam document, including the paper's own structure
+            if qn and qn in memo_map:
+                if hasattr(q, "memo"):
+                    if not q.memo:
+                        q.memo = memo_map[qn]
+                elif isinstance(q, dict) and not q.get("memo"):
+                    q["memo"] = memo_map[qn]
+
+        # 4a. Top-level exam document
         sections_index = []
         seen_sections = set()
-        for q in questions:
-            key = q.get("section", "A")
-            if key in seen_sections:
+        for sec in sections:
+            sec_name = getattr(sec, "section", "A")
+            if sec_name in seen_sections:
                 continue
-            seen_sections.add(key)
+            seen_sections.add(sec_name)
             sections_index.append({
-                "section":      key,
-                "title":        q.get("section_title", ""),
-                "instructions": q.get("section_instructions", ""),
+                "section": sec_name,
+                "title": getattr(sec, "section_title", ""),
+                "instructions": getattr(sec, "section_instructions", ""),
             })
 
         db.collection("exams").document(exam_id).set({
-            "title":                title,
-            "subject":              subject,
-            "grade":                grade,
-            "year":                 meta.get("year", "") or paper_meta.get("year", ""),
-            "curriculum":           meta.get("curriculum", "CAPS"),
-            "paperNumber":          paper_meta.get("paper_number", ""),
-            "examTypeDetected":     paper_meta.get("exam_type", ""),
-            "paperTotalMarks":      paper_meta.get("total_marks"),
-            "timeAllocation":       paper_meta.get("time_allocation", ""),
-            "paperInstructions":    paper_meta.get("instructions", ""),
-            "sections":             sections_index,
-            "teacherName":          meta.get("teacherName", ""),
-            "uploadedBy":           meta.get("uploadedBy", ""),
-            "schoolId":             meta.get("schoolId", school_id),
-            "examDuration":         meta.get("examDuration", 0),
-            "examStoragePath":      meta.get("examStoragePath", ""),
-            "memoStoragePath":      meta.get("memoStoragePath", ""),
-            "examStorageUrl":       meta.get("examStorageUrl", ""),
-            "memoStorageUrl":       meta.get("memoStorageUrl", ""),
-            "uploadedAt":           meta.get("uploadedAt", ""),
-            "memoMerged":           bool(memo_map),
-            "questionsExtracted":   True,
-            "status":               "ready",
-            "totalQuestions":       len(questions),
+            "title": title,
+            "subject": subject,
+            "grade": grade,
+            "year": meta.get("year", "") or paper_meta.get("year", ""),
+            "curriculum": meta.get("curriculum", "CAPS"),
+            "paperNumber": paper_meta.get("paper_number", ""),
+            "examTypeDetected": paper_meta.get("exam_type", ""),
+            "paperTotalMarks": paper_meta.get("total_marks"),
+            "timeAllocation": paper_meta.get("time_allocation", ""),
+            "paperInstructions": paper_meta.get("instructions", ""),
+            "sections": sections_index,
+            "teacherName": meta.get("teacherName", ""),
+            "uploadedBy": meta.get("uploadedBy", ""),
+            "schoolId": meta.get("schoolId", school_id),
+            "examDuration": meta.get("examDuration", 0),
+            "examStoragePath": meta.get("examStoragePath", ""),
+            "memoStoragePath": meta.get("memoStoragePath", ""),
+            "examStorageUrl": meta.get("examStorageUrl", ""),
+            "memoStorageUrl": meta.get("memoStorageUrl", ""),
+            "uploadedAt": meta.get("uploadedAt", ""),
+            "memoMerged": bool(memo_map),
+            "questionsExtracted": True,
+            "status": "ready",
+            "totalQuestions": len(questions),
             "questionsWithContext": with_ctx,
-            "extractedAt":          fs_admin.SERVER_TIMESTAMP,
-            "sourceUploadId":       exam_id,
+            "fileHash": file_hash,  # Saved for future duplicate detection
+            "extractedAt": fs_admin.SERVER_TIMESTAMP,
+            "sourceUploadId": exam_id,
         }, merge=True)
 
-        # 4b. Question documents, batched (Firestore caps a batch at 500)
-        # NOTE: snake_case in, camelCase in Firestore, snake_case out again in
-        # _load_exam(). Keep all three in step or fields vanish silently.
+        # 4b. Write question documents in Firestore batch
         batch = db.batch()
         written = 0
 
         for i, q in enumerate(questions):
-            qtext = str(q.get("question") or "").strip()
+            # Access attributes safely whether q is a dataclass or dict
+            qtext = str(getattr(q, "question", "") or (q.get("question") if isinstance(q, dict) else "")).strip()
             if not qtext:
                 continue
 
             ref = db.collection("exam_questions").document(f"{exam_id}_{i:04d}")
             batch.set(ref, {
-                "examId":              exam_id,
-                "questionNumber":      str(q.get("question_number") or i + 1),
-                "parentQuestion":      q.get("parent_question", ""),
-                "parentContext":       q.get("parent_context") or None,
-                "section":             q.get("section", "A"),
-                "sectionTitle":        q.get("section_title", ""),
-                "sectionInstructions": q.get("section_instructions", ""),
-                "instructions":        q.get("instructions", ""),
-                "questionText":        qtext,
-                "type":                q.get("type", "open"),
-                "marks":               q.get("marks", 1),
-                "options":             q.get("options"),
-                "columnA":             q.get("column_a"),
-                "columnB":             q.get("column_b"),
-                "questionTable":       q.get("table_markdown"),
-                "questionLatex":       q.get("latex"),
-                "hasVisual":           bool(q.get("has_visual")),
-                "visualDescription":   q.get("visual_description"),
-                "memo":                str(q.get("memo") or ""),
-                "order":               q.get("order", i),
+                "examId": exam_id,
+                "questionNumber": str(getattr(q, "question_number", None) or (
+                    q.get("question_number") if isinstance(q, dict) else i + 1)),
+                "parentQuestion": getattr(q, "parent_question", "") or (
+                    q.get("parent_question", "") if isinstance(q, dict) else ""),
+                "parentContext": getattr(q, "parent_context", None) or (
+                    q.get("parent_context") if isinstance(q, dict) else None),
+                "section": getattr(q, "section", "A") or (q.get("section", "A") if isinstance(q, dict) else "A"),
+                "sectionTitle": getattr(q, "section_title", "") or (
+                    q.get("section_title", "") if isinstance(q, dict) else ""),
+                "sectionInstructions": getattr(q, "section_instructions", "") or (
+                    q.get("section_instructions", "") if isinstance(q, dict) else ""),
+                "instructions": getattr(q, "instructions", "") or (
+                    q.get("instructions", "") if isinstance(q, dict) else ""),
+                "questionText": qtext,
+                "type": getattr(q, "question_type", "open") or (
+                    q.get("type", "open") if isinstance(q, dict) else "open"),
+                "marks": getattr(q, "marks", 1) or (q.get("marks", 1) if isinstance(q, dict) else 1),
+                "options": getattr(q, "options", None) or (q.get("options") if isinstance(q, dict) else None),
+                "columnA": getattr(q, "column_a", None) or (q.get("column_a") if isinstance(q, dict) else None),
+                "columnB": getattr(q, "column_b", None) or (q.get("column_b") if isinstance(q, dict) else None),
+                "questionTable": getattr(q, "table_markdown", None) or (
+                    q.get("table_markdown") if isinstance(q, dict) else None),
+                "questionLatex": getattr(q, "formula", None) or (q.get("latex") if isinstance(q, dict) else None),
+                "hasVisual": bool(
+                    getattr(q, "has_visual", False) or (q.get("has_visual") if isinstance(q, dict) else False)),
+                "visualDescription": getattr(q, "visual_description", None) or (
+                    q.get("visual_description") if isinstance(q, dict) else None),
+                "memo": str(getattr(q, "memo", "") or (q.get("memo", "") if isinstance(q, dict) else "")),
+                "order": i,
             })
             written += 1
 
@@ -1455,12 +1517,12 @@ def run_extraction_pipeline(exam_id: str, meta: dict, school_id: str, subject_na
                 batch = db.batch()
 
         batch.commit()
-        logger.info("[Pipeline] Done — %d questions, %d memo answers",
-                    written, len(memo_map))
+        logger.info("[Pipeline] Done — %d questions, %d memo answers", written, len(memo_map))
+
         set_status("extracted", {
-            "extractedAt":    datetime.now(timezone.utc).isoformat(),
+            "extractedAt": datetime.now(timezone.utc).isoformat(),
             "totalQuestions": written,
-            "memoMerged":     bool(memo_map),
+            "memoMerged": bool(memo_map),
         })
 
     except Exception as e:
@@ -1485,21 +1547,22 @@ def run_extraction_pipeline(exam_id: str, meta: dict, school_id: str, subject_na
 def _launch_pipeline(exam_id: str, meta: dict, school_id: str, subject_name: str) -> bool:
     """Start extraction in a daemon thread unless it's already running or done."""
     if _is_processing(exam_id):
-        logger.info("[Pipeline] Already processing: %s", exam_id)
+        logger.info("[Pipeline] Already processing thread active: %s", exam_id)
         return False
 
     try:
         snap = db.collection("exams").document(exam_id).get()
         if snap.exists and snap.to_dict().get("status") == "ready":
-            logger.info("[Pipeline] Already ready: %s", exam_id)
+            logger.info("[Pipeline] Already ready in Firestore: %s", exam_id)
             return False
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("[Pipeline] Firestore check warning: %s", e)
 
     _mark_processing(exam_id)
     db.collection("exams").document(exam_id).set(
         {"status": "processing", "startedAt": fs_admin.SERVER_TIMESTAMP}, merge=True
     )
+
     threading.Thread(
         target=run_extraction_pipeline,
         args=(exam_id, meta, school_id, subject_name),
