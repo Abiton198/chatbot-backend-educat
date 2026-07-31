@@ -1338,7 +1338,17 @@ def run_extraction_pipeline(exam_id: str, meta: dict, school_id: str, subject_na
             )
 
         # 2. Extract — one call, whole paper
-        paper_meta, questions = extract_exam(exam_bytes, exam_fn, subject, grade)
+        # paper_meta, questions = extract_exam(exam_bytes, exam_fn, subject, grade)
+        # Determine whether to pass "document" or "text"
+        kind = "document"  # or "text" if pre-extracted
+        payload = exam_bytes
+
+        # Call extract_exam with the expected arguments
+        metadata, sections, stats = extract_exam(kind, payload, subject, grade)
+
+        # Flatten questions if app.py expects a flat list of questions
+        questions = [q for sec in sections for q in sec.questions]
+        paper_meta = metadata.__dict__ if hasattr(metadata, '__dict__') else metadata
         if not questions:
             raise ValueError(
                 "No questions were found. Confirm the file is a complete exam paper."
