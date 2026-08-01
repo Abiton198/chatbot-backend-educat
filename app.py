@@ -89,9 +89,11 @@ from firebase_admin import firestore
 import traceback
 import threading
 import hashlib
+from groq import Groq
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("eduket")
+groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2520,8 +2522,7 @@ def agent_chat():
         student_info = student_doc.to_dict() if student_doc.exists else {}
         student_name = student_info.get('displayName', student_info.get('name', 'Student'))
 
-        # Query the correct collection: 'exam_attempts'
-        # Tries searching by 'userId' (standard) or 'studentId'
+        # Fetch up to 10 recent attempts from 'exam_attempts'
         attempts_ref = (
             db.collection('exam_attempts')
             .where('userId', '==', student_id)
@@ -2529,7 +2530,6 @@ def agent_chat():
         )
         docs = list(attempts_ref.stream())
 
-        # Fallback query if 'studentId' is used instead of 'userId'
         if not docs:
             attempts_ref = (
                 db.collection('exam_attempts')
@@ -2541,25 +2541,21 @@ def agent_chat():
         history_summary = []
         for doc in docs:
             res = doc.to_dict() or {}
-
-            # Extract basic paper info
             subject = res.get('subject', 'General')
             exam_title = res.get('examTitle', res.get('title', 'Exam Paper'))
             score = res.get('score', res.get('totalMarksObtained', 'N/A'))
             percentage = res.get('percentage', 'N/A')
 
-            # Extract nested AI Analysis data
             analysis = res.get('analysis', {})
             overall_summary = analysis.get('overallSummary', '') if isinstance(analysis, dict) else ''
 
-            # Extract concept gaps (array)
             concept_gaps = []
             if isinstance(analysis, dict):
                 concept_gaps = analysis.get('conceptGaps', [])
             if not concept_gaps:
                 concept_gaps = res.get('concept_gaps', [])
 
-            gaps_str = f" | Weak Areas/Concept Gaps: {', '.join(concept_gaps)}" if concept_gaps else ""
+            gaps_str = f" | Weak Areas: {', '.join(concept_gaps)}" if concept_gaps else ""
             summary_str = f" | Summary: {overall_summary}" if overall_summary else ""
 
             history_summary.append(
@@ -2572,11 +2568,8 @@ def agent_chat():
             else "No previous exam performance records found."
         )
 
-        app.logger.info(f"[Agent Context Loaded]: {performance_context}")
-
-        # 2. Construct System Instructions
-        system_instructions = f"""
-You are AI Mentor, an empathetic Socratic academic tutor for {student_name}.
+        # 2. System Prompt
+        system_prompt = f"""You are AI Mentor, an empathetic Socratic academic tutor for {student_name}.
 
 ---
 STUDENT PERFORMANCE HISTORY & TRACE:
@@ -2589,43 +2582,33 @@ Do NOT give away the final answer immediately. Guide {student_name} step-by-step
 RULES:
 1. Probe with ONE targeted sub-question or hint at a time to lead them to the next logical step.
 2. If they make a mistake, acknowledge what they got right, correct the misconception gently, and ask a simpler guiding question.
-3. Reference their past exam performance, weak spots, and concept gaps directly where relevant to provide targeted support.
+3. Reference their past exam performance and weak spots directly where relevant to provide targeted support.
 4. When they arrive at the final correct answer, praise them warmly and summarize key takeaways.
-5. Keep turns short, engaging, and conversational (under 4 sentences).
-"""
+5. Keep turns short, engaging, and conversational (under 4 sentences)."""
 
-        # 3. Build turn-by-turn payload using Gemini format
-        contents = [
-            {"role": "user", "parts": [{"text": system_instructions}]},
-            {"role": "model", "parts": [{"text": f"Understood! Ready to guide {student_name} step-by-step."}]}
-        ]
+        # 3. Build messages array for Groq (System -> History -> Current User Message)
+        messages = [{"role": "system", "content": system_prompt}]
 
-        # Append history turns
         for msg in chat_history:
-            role = "user" if msg.get("sender") == "user" or msg.get("role") == "user" else "model"
+            role = "user" if msg.get("sender") == "user" or msg.get("role") == "user" else "assistant"
             msg_text = msg.get("text", msg.get("message", ""))
             if msg_text:
-                contents.append({
-                    "role": role,
-                    "parts": [{"text": msg_text}]
-                })
+                messages.append({"role": role, "content": msg_text})
 
-        # Append current user prompt
-        contents.append({"role": "user", "parts": [{"text": user_message}]})
+        messages.append({"role": "user", "content": user_message})
 
-        # 4. Generate Content via Gemini SDK
-        MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+        # 4. Generate Completion via Groq API
+        groq_model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
-        response = get_genai().models.generate_content(
-            model=MODEL_NAME,
-            contents=contents
+        completion = groq_client.chat.completions.create(
+            model=groq_model,
+            messages=messages,
+            temperature=0.6,
+            max_tokens=500,
         )
 
-        reply_text = (
-            response.text
-            if hasattr(response, 'text') and response.text
-            else "Let's take a look at this together—what is the first step you think we should take?"
-        )
+        reply_text = completion.choices[
+                         0].message.content or "Let's take a look at this together—what is the first step you think we should take?"
 
         return jsonify({
             'response': reply_text,
