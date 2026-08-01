@@ -2518,33 +2518,52 @@ def agent_chat():
         # 1. Fetch Student Profile & Detailed Exam History from Firestore
         student_doc = db.collection('users').document(student_id).get()
         student_info = student_doc.to_dict() if student_doc.exists else {}
-        student_name = student_info.get('displayName', 'Student')
+        student_name = student_info.get('displayName', student_info.get('name', 'Student'))
 
-        # Fetch up to 10 recent submissions ordered by timestamp if available
-        submissions_ref = (
-            db.collection('submissions')
-            .where('studentId', '==', student_id)
+        # Query the correct collection: 'exam_attempts'
+        # Tries searching by 'userId' (standard) or 'studentId'
+        attempts_ref = (
+            db.collection('exam_attempts')
+            .where('userId', '==', student_id)
             .limit(10)
         )
+        docs = list(attempts_ref.stream())
+
+        # Fallback query if 'studentId' is used instead of 'userId'
+        if not docs:
+            attempts_ref = (
+                db.collection('exam_attempts')
+                .where('studentId', '==', student_id)
+                .limit(10)
+            )
+            docs = list(attempts_ref.stream())
 
         history_summary = []
-        for doc in submissions_ref.stream():
-            res = doc.to_dict()
-            subject = res.get('subject', 'General')
-            exam_title = res.get('examTitle', res.get('title', 'Exam'))
-            score = res.get('score', res.get('totalScore', 'N/A'))
-            percentage = res.get('percentage', 'N/A')
-            date_str = res.get('submittedAt', res.get('createdAt', ''))
+        for doc in docs:
+            res = doc.to_dict() or {}
 
-            # Extract detailed topic/concept gaps if present in the submission
-            concept_gaps = res.get('concept_gaps', [])
-            if isinstance(concept_gaps, list) and concept_gaps:
-                gaps_str = f" | Weak areas: {', '.join(concept_gaps)}"
-            else:
-                gaps_str = ""
+            # Extract basic paper info
+            subject = res.get('subject', 'General')
+            exam_title = res.get('examTitle', res.get('title', 'Exam Paper'))
+            score = res.get('score', res.get('totalMarksObtained', 'N/A'))
+            percentage = res.get('percentage', 'N/A')
+
+            # Extract nested AI Analysis data
+            analysis = res.get('analysis', {})
+            overall_summary = analysis.get('overallSummary', '') if isinstance(analysis, dict) else ''
+
+            # Extract concept gaps (array)
+            concept_gaps = []
+            if isinstance(analysis, dict):
+                concept_gaps = analysis.get('conceptGaps', [])
+            if not concept_gaps:
+                concept_gaps = res.get('concept_gaps', [])
+
+            gaps_str = f" | Weak Areas/Concept Gaps: {', '.join(concept_gaps)}" if concept_gaps else ""
+            summary_str = f" | Summary: {overall_summary}" if overall_summary else ""
 
             history_summary.append(
-                f"- [{subject}] {exam_title}: Score {score} ({percentage}%){gaps_str}"
+                f"- [{subject}] {exam_title}: Score {score} ({percentage}%){gaps_str}{summary_str}"
             )
 
         performance_context = (
@@ -2553,7 +2572,9 @@ def agent_chat():
             else "No previous exam performance records found."
         )
 
-        # 2. Construct System Instructions using the traced performance context
+        app.logger.info(f"[Agent Context Loaded]: {performance_context}")
+
+        # 2. Construct System Instructions
         system_instructions = f"""
 You are AI Mentor, an empathetic Socratic academic tutor for {student_name}.
 
@@ -2568,18 +2589,18 @@ Do NOT give away the final answer immediately. Guide {student_name} step-by-step
 RULES:
 1. Probe with ONE targeted sub-question or hint at a time to lead them to the next logical step.
 2. If they make a mistake, acknowledge what they got right, correct the misconception gently, and ask a simpler guiding question.
-3. Reference their past exam performance and weak spots directly where relevant to boost confidence or provide targeted support.
+3. Reference their past exam performance, weak spots, and concept gaps directly where relevant to provide targeted support.
 4. When they arrive at the final correct answer, praise them warmly and summarize key takeaways.
 5. Keep turns short, engaging, and conversational (under 4 sentences).
 """
 
-        # 3. Build turn-by-turn payload using your exact buildup structure
+        # 3. Build turn-by-turn payload using Gemini format
         contents = [
             {"role": "user", "parts": [{"text": system_instructions}]},
             {"role": "model", "parts": [{"text": f"Understood! Ready to guide {student_name} step-by-step."}]}
         ]
 
-        # Append turn-by-turn history passed from frontend
+        # Append history turns
         for msg in chat_history:
             role = "user" if msg.get("sender") == "user" or msg.get("role") == "user" else "model"
             msg_text = msg.get("text", msg.get("message", ""))
@@ -2589,11 +2610,11 @@ RULES:
                     "parts": [{"text": msg_text}]
                 })
 
-        # Append current message
+        # Append current user prompt
         contents.append({"role": "user", "parts": [{"text": user_message}]})
 
         # 4. Generate Content via Gemini SDK
-        MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+        MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
         response = get_genai().models.generate_content(
             model=MODEL_NAME,
