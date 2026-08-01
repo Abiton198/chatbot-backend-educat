@@ -1381,16 +1381,8 @@ def run_extraction_pipeline(exam_id: str, meta: dict, school_id: str, subject_na
             set_status("ready", {"duplicatedFrom": existing_matches[0].id})
             return
 
-        # 2. Extract Paper via Gemini — Correct parameters (kind, payload, subject, grade)
-        kind = "document"  # "document" for PDF bytes or "text" for plain text
-        payload = exam_bytes
-
-        # Correctly unpack the 3 return values from extract_exam
-        metadata, sections, stats = extract_exam(kind, payload, subject, grade)
-
-        # Flatten questions from sections to match internal schema
-        questions = [q for sec in sections for q in sec.questions]
-        paper_meta = metadata.__dict__ if hasattr(metadata, "__dict__") else metadata
+        # 2. Extract Paper via Gemini (using local app.py implementation)
+        paper_meta, questions = extract_exam(exam_bytes, exam_fn, subject, grade)
 
         if not questions:
             raise ValueError(
@@ -1427,15 +1419,24 @@ def run_extraction_pipeline(exam_id: str, meta: dict, school_id: str, subject_na
         # 4a. Top-level exam document
         sections_index = []
         seen_sections = set()
-        for sec in sections:
-            sec_name = getattr(sec, "section", "A")
+
+        for q in questions:
+            # Handle both dataclass instances and dicts safely
+            sec_name = getattr(q, "section", None) or (q.get("section") if isinstance(q, dict) else "A") or "A"
+
             if sec_name in seen_sections:
                 continue
             seen_sections.add(sec_name)
+
+            sec_title = getattr(q, "section_title", None) or (
+                q.get("section_title") if isinstance(q, dict) else "") or ""
+            sec_inst = getattr(q, "section_instructions", None) or (
+                q.get("section_instructions") if isinstance(q, dict) else "") or ""
+
             sections_index.append({
                 "section": sec_name,
-                "title": getattr(sec, "section_title", ""),
-                "instructions": getattr(sec, "section_instructions", ""),
+                "title": sec_title,
+                "instructions": sec_inst,
             })
 
         db.collection("exams").document(exam_id).set({
