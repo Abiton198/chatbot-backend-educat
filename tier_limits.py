@@ -1,3 +1,10 @@
+"""
+tier_limits.py — Dynamic Seat-Based Quotas & Usage Tracking
+═══════════════════════════════════════════════════════════════════════════════
+Replaces hardcoded tiers with dynamic seat-based calculations (Students + Teachers).
+Uses server-side Firestore aggregation (.count()) for high-performance usage reads.
+"""
+
 import logging
 import os
 import threading
@@ -10,11 +17,15 @@ log = logging.getLogger(__name__)
 
 FIRESTORE_TIMEOUT = 8.0
 
-# ── Lazy per-process client ─────────────────────────────────────────────────
-# A module-level `db = firestore.client()` is inherited across gunicorn's fork.
-# The child gets a gRPC channel it doesn't own: .stream() blocks forever and
-# raises nothing, so no exception handler can catch it. Build on first use.
+# ── Baseline Quotas Per Seat ──────────────────────────────────────────────────
+DEFAULT_EXAMS_PER_STUDENT = 2  # Monthly exam upload quota per purchased student seat
+DEFAULT_EXAMS_PER_TEACHER = 2  # Monthly exam upload quota per purchased teacher seat
+FREE_TIER_MONTHLY_LIMIT = 4  # Free/trial tier default monthly exam upload quota
 
+# Exams are scoped to the current calendar month; headcounts are standing total seats
+MONTHLY_SCOPED = {"exams", "exam"}
+
+# ── Lazy Per-Process Firestore Client ─────────────────────────────────────────
 _db = None
 _db_lock = threading.Lock()
 
@@ -29,121 +40,167 @@ def get_db():
     return _db
 
 
-# ── Tier table ──────────────────────────────────────────────────────────────
-
-LIMITS = {
-    "free":     {"exams":   4, "teachers":  2, "students":   30},
-    "silver":   {"exams":  15, "teachers":  5, "students":  150},
-    "gold":     {"exams":  30, "teachers": 10, "students":  300},
-    "platinum": {"exams":  80, "teachers": 25, "students":  800},
-    "diamond":  {"exams": 150, "teachers": 50, "students": 2000},
-}
-
-# Exams are a monthly quota; people are a standing headcount.
-MONTHLY_SCOPED = {"exams"}
-
+# ── Internal Helpers ──────────────────────────────────────────────────────────
 
 def _count(query) -> int:
     """
-    Server-side count. Aggregation queries bill one read per 1000 documents
-    and transfer no document bodies — the previous len(list(.stream())) pulled
-    every matching doc, so a 2000-student school paid 2000 reads per check.
+    Server-side count aggregation query. Bills 1 read per 1,000 documents
+    instead of pulling full document payloads into memory.
     """
     try:
         result = query.count().get(timeout=FIRESTORE_TIMEOUT)
         return int(result[0][0].value)
     except AttributeError:
-        # Older google-cloud-firestore without aggregation support.
-        log.warning("aggregation unavailable, falling back to stream()")
+        # Fallback for older google-cloud-firestore SDKs lacking aggregation
+        log.warning("Aggregation query unavailable, falling back to stream()")
         return sum(1 for _ in query.stream(timeout=FIRESTORE_TIMEOUT))
 
 
-def _month_start() -> datetime:
+def _month_start_iso() -> str:
+    """
+    Returns the ISO-8601 string for the 1st day of the current UTC month.
+    Exams store `uploadedAt` as an ISO string, enabling fast string filter queries.
+    """
     now = datetime.now(timezone.utc)
-    return now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    return datetime(now.year, now.month, 1, tzinfo=timezone.utc).isoformat()
+
+
+# ── Dynamic Limit Calculation Engine ─────────────────────────────────────────
+
+def get_school_exam_limit(school_id: str) -> int:
+    """
+    Calculates monthly exam upload limit based on active purchased seats
+    or returns custom/overridden limit if set on the school subscription.
+    """
+    if not school_id:
+        return FREE_TIER_MONTHLY_LIMIT
+
+    try:
+        db = get_db()
+        sub_doc = db.collection("subscriptions").document(school_id).get(timeout=FIRESTORE_TIMEOUT)
+
+        if sub_doc.exists:
+            sub_data = sub_doc.to_dict() or {}
+
+            # 1. Custom explicit limit override takes precedence if set
+            if "customExamLimit" in sub_data:
+                return int(sub_data["customExamLimit"])
+
+            # 2. Seat-based dynamic calculation
+            if sub_data.get("status") == "active":
+                seats = sub_data.get("seats", {})
+                students = int(seats.get("students", 0))
+                teachers = int(seats.get("teachers", 0))
+
+                calculated_limit = (students * DEFAULT_EXAMS_PER_STUDENT) + (teachers * DEFAULT_EXAMS_PER_TEACHER)
+                return max(calculated_limit, FREE_TIER_MONTHLY_LIMIT)
+
+        return FREE_TIER_MONTHLY_LIMIT
+
+    except Exception as e:
+        log.error("[Quota Calculation] Error calculating exam limit for school %s: %s", school_id, e)
+        return FREE_TIER_MONTHLY_LIMIT
 
 
 def count_school_usage(school_id: str, resource: str) -> int:
     """
-    Single source of truth for usage counts. Import this from /exams/upload as
-    well — two independent counting implementations will drift, and the one in
-    the pre-check will start refusing what the upload endpoint allows.
-    """
-    db = get_db()
+    Single source of truth for counting resource usage across all endpoints.
 
-    if resource == "exams":
-        q = db.collection("exams").where(filter=FieldFilter("schoolId", "==", school_id))
-        if "exams" in MONTHLY_SCOPED:
-            q = q.where(filter=FieldFilter("createdAt", ">=", _month_start()))
+    Supported resources:
+      - 'exams' or 'exam' (Counts uploads in the current UTC calendar month)
+      - 'teachers' or 'teacher' (Counts active registered teacher profiles)
+      - 'students' or 'student' (Counts active registered student profiles)
+    """
+    if not school_id:
+        return 0
+
+    db = get_db()
+    res = resource.lower().rstrip("s")
+
+    if res == "exam":
+        q = (db.collection("exams")
+             .where(filter=FieldFilter("schoolId", "==", school_id))
+             .where(filter=FieldFilter("uploadedAt", ">=", _month_start_iso())))
         return _count(q)
 
-    role_target = resource[:-1]   # 'teachers' → 'teacher'
+    # For 'teacher' or 'student' headcounts
     q = (db.collection("users")
-           .where(filter=FieldFilter("schoolId", "==", school_id))
-           .where(filter=FieldFilter("role", "==", role_target)))
+         .where(filter=FieldFilter("schoolId", "==", school_id))
+         .where(filter=FieldFilter("role", "==", res)))
     return _count(q)
 
 
-def check_school_limit(school_id: str, limit_type: str) -> tuple:
+def check_school_exam_quota(school_id: str) -> tuple[bool, int, int]:
     """
-    Returns (is_allowed, error_message).
+    Evaluates current month exam upload quota.
+    Returns: (can_upload: bool, used: int, limit: int)
+    """
+    limit = get_school_exam_limit(school_id)
+    used = count_school_usage(school_id, "exams")
+    return (used < limit), used, limit
 
-    Fails open on infrastructure errors — the authoritative enforcement lives
-    at the write endpoint, so a degraded Firestore should not stop teaching.
+
+# ── Master Gatekeeper Evaluation ──────────────────────────────────────────────
+
+def check_school_limit(school_id: str, limit_type: str) -> tuple[bool, str]:
+    """
+    Evaluates capacity for a requested resource/seat or exam upload.
+    Used for pre-checks and authoritative write guardrails.
     """
     if not school_id:
-        return False, "School ID is required."
+        return False, "No school ID associated with request."
 
-    # ── 1. Normalize the key first — cheap, and avoids a wasted read ────────
-    key = (limit_type or "").lower().strip()
-    if key in ("teacher", "student", "exam"):
-        key = f"{key}s"
-    if key not in ("exams", "teachers", "students"):
-        log.warning("unknown limit_type %r — failing open", limit_type)
-        return True, ""
+    db = get_db()
+    res = limit_type.lower().rstrip("s")
 
-    # ── 2. School document ─────────────────────────────────────────────────
+    # 1. Fetch subscription details
     try:
-        school_doc = get_db().collection("schools").document(school_id).get(timeout=FIRESTORE_TIMEOUT)
-    except Exception as exc:
-        log.warning("school fetch failed for %s: %s: %s", school_id, type(exc).__name__, exc)
-        return True, ""
+        sub_doc = db.collection("subscriptions").document(school_id).get(timeout=FIRESTORE_TIMEOUT)
+        sub_data = sub_doc.to_dict() if sub_doc.exists else {}
+    except Exception as e:
+        log.error("[Limit Check] Subscription lookup failed for school %s: %s", school_id, e)
+        return False, "Unable to verify school subscription status."
 
-    if not school_doc.exists:
-        return False, "School not found. Please ask your principal to register the school first."
+    status = sub_data.get("status", "unpaid")
+    seats = sub_data.get("seats", {})
+    purchased_students = int(seats.get("students", 0))
+    purchased_teachers = int(seats.get("teachers", 0))
 
-    school_data = school_doc.to_dict() or {}
+    # --------------------------------------------------------------------------
+    # CHECK 1: Teacher Registration Seats
+    # --------------------------------------------------------------------------
+    if res == "teacher":
+        if status != "active" and purchased_teachers == 0:
+            return False, "Active subscription required to register teachers."
 
-    # Accept the field under any of the names the schema has used. A silent
-    # miss here reads as 'free' and throttles a paying school to 4 exams.
-    raw_tier = (school_data.get("tier")
-                or school_data.get("tierId")
-                or school_data.get("subscriptionTier")
-                or "")
-    tier_id = str(raw_tier).lower().strip()
+        teacher_count = count_school_usage(school_id, "teachers")
 
-    if tier_id not in LIMITS:
-        log.warning("school %s has unrecognised tier %r — applying free limits",
-                    school_id, raw_tier)
-        tier_id = "free"
+        if teacher_count >= purchased_teachers:
+            return False, f"Teacher seat limit reached ({teacher_count}/{purchased_teachers}). Please upgrade your seat allocation."
 
-    max_allowed = LIMITS[tier_id].get(key, 0)
+        return True, "Allowed"
 
-    # ── 3. Count ───────────────────────────────────────────────────────────
-    try:
-        current = count_school_usage(school_id, key)
-    except Exception as exc:
-        log.warning("count failed for %s/%s: %s: %s", school_id, key, type(exc).__name__, exc)
-        return True, ""
+    # --------------------------------------------------------------------------
+    # CHECK 2: Student Registration Seats
+    # --------------------------------------------------------------------------
+    elif res == "student":
+        if status != "active" and purchased_students == 0:
+            return False, "Active subscription required to register students."
 
-    window = " this month" if key in MONTHLY_SCOPED else ""
-    log.info("[limit] %s | %s | %s: %s/%s%s", school_id, tier_id, key, current, max_allowed, window)
+        student_count = count_school_usage(school_id, "students")
 
-    if current >= max_allowed:
-        return False, (
-            f"Your school has reached the {tier_id.capitalize()} plan limit of "
-            f"{max_allowed} {key}{window}. Ask your principal to upgrade the plan "
-            f"to add more {key}."
-        )
+        if student_count >= purchased_students:
+            return False, f"Student seat limit reached ({student_count}/{purchased_students}). Please upgrade your seat allocation."
 
-    return True, ""
+        return True, "Allowed"
+
+    # --------------------------------------------------------------------------
+    # CHECK 3: Exam Monthly Generation/Upload Quota
+    # --------------------------------------------------------------------------
+    elif res == "exam":
+        can_upload, used, limit = check_school_exam_quota(school_id)
+        if not can_upload:
+            return False, f"Monthly exam quota reached ({used}/{limit}). Upgrade seats to increase quota."
+        return True, "Allowed"
+
+    return True, "Allowed"

@@ -85,11 +85,11 @@ from google.genai import types
 from tier_limits import check_school_limit, get_db
 from extraction_engine import extract_document
 from extract_exam import extract_exam, extract_memo
-from firebase_admin import firestore
 import traceback
 import threading
 import hashlib
 from groq import Groq
+from billing_routes import billing_bp
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("eduket")
@@ -105,6 +105,7 @@ MODEL_MARK    = os.getenv("GEMINI_MODEL_MARK",    "gemini-3.1-flash-lite")
 
 _genai_client: genai.Client | None = None
 _genai_lock = threading.Lock()
+
 
 def get_genai() -> genai.Client:
     """
@@ -579,166 +580,6 @@ def _has_usable_text_layer(text: str, page_count: int) -> bool:
     return len(text) >= (MIN_CHARS_PER_PAGE * max(page_count, 1))
 
 
-def extract_exam(file_bytes: bytes, filename: str,
-                 subject: str, grade: str) -> tuple[dict, list]:
-    """
-    Parse a whole exam paper in a single call.
-
-    Returns (paper_meta, questions) — unchanged shape from the original.
-    Now tries free local text extraction before paying for document vision.
-    """
-    pdf_bytes = as_pdf(file_bytes, filename)
-    if not pdf_bytes:
-        raise ValueError(
-            f"Could not read {filename}. Upload a PDF, DOCX or DOC file. "
-            "If this is a Word document, confirm LibreOffice is installed."
-        )
-
-    prompt = EXTRACTION_PROMPT.format(subject=subject, grade=grade)
-
-    # --- Try free local extraction first ---
-    local_text, page_count = _extract_pdf_text_local(pdf_bytes)
-
-    if _has_usable_text_layer(local_text, page_count):
-        logger.info(
-            "[Extract] %s | local text layer found (%d chars, %d pages) — "
-            "using cheap text call, skipping ai_document",
-            filename, len(local_text), page_count,
-        )
-        # Same schema, same structured output — just text input instead of
-        # raw document bytes. Priced as plain tokens, not vision tokens.
-        result = ai_json(
-            prompt + "\n\n--- EXAM PAPER TEXT ---\n" + local_text,
-            schema=EXAM_SCHEMA,
-        )
-    else:
-        logger.info(
-            "[Extract] %s | insufficient local text (%d chars, %d pages) — "
-            "falling back to ai_document (scanned/image PDF)",
-            filename, len(local_text), page_count,
-        )
-        result = ai_document(
-            pdf_bytes,
-            "application/pdf",
-            prompt,
-            schema=EXAM_SCHEMA,
-        )
-
-    # --- Everything below is unchanged from your original implementation ---
-    paper_meta = result.get("metadata") or {}
-
-    contexts = {}
-    for c in (result.get("contexts") or []):
-        group = str(c.get("group", "")).strip()
-        text = (c.get("text") or "").strip()
-        if group and text:
-            contexts[group] = text
-
-    questions: list[dict] = []
-    order = 0
-
-    for sec in (result.get("sections") or []):
-        section_letter = sec.get("section", "A")
-        section_title = sec.get("section_title", "")
-        section_instructions = sec.get("section_instructions") or ""
-
-        for q in (sec.get("questions") or []):
-            qnum = str(q.get("question_number") or "").strip()
-
-            ref = q.get("context_ref") or (qnum.split(".")[0] if qnum else "")
-            parent_context = contexts.get(str(ref), "")
-
-            opts = q.get("options")
-            options = None
-            if isinstance(opts, list) and opts:
-                options = {o["key"]: o["value"] for o in opts if o.get("key")}
-
-            try:
-                marks = max(1, int(q.get("marks") or 1))
-            except (TypeError, ValueError):
-                marks = 1
-
-            questions.append({
-                "question_number": qnum or str(order + 1),
-                "parent_question": q.get("parent_question", ""),
-                "parent_context": parent_context,
-                "section": section_letter,
-                "section_title": section_title,
-                "section_instructions": section_instructions,
-                "instructions": q.get("instructions") or "",
-                "question": (q.get("question") or "").strip(),
-                "type": (q.get("type") or "open").lower(),
-                "marks": marks,
-                "options": options,
-                "column_a": q.get("column_a"),
-                "column_b": q.get("column_b"),
-                "table_markdown": q.get("table_markdown"),
-                "latex": q.get("latex"),
-                "has_visual": bool(q.get("has_visual")),
-                "visual_description": q.get("visual_description"),
-                "order": order,
-            })
-            order += 1
-
-    with_ctx = sum(1 for q in questions if q["parent_context"])
-    logger.info(
-        "[Extract] %s | %d sections | %d questions | %d source items | "
-        "%d questions carry source material",
-        filename, len(result.get("sections") or []), len(questions),
-        len(contexts), with_ctx,
-    )
-    return paper_meta, questions
-
-
-# ---------------------------------------------------------------------------
-# extract_memo — same signature and return shape as before
-# ---------------------------------------------------------------------------
-def extract_memo(file_bytes: bytes, filename: str, subject: str, grade: str) -> dict:
-    """Parse a marking memorandum. Returns {normalised_question_number: answer}."""
-    pdf_bytes = as_pdf(file_bytes, filename)
-    if not pdf_bytes:
-        logger.warning("[Memo] could not convert %s — skipping", filename)
-        return {}
-
-    prompt = MEMO_PROMPT.format(subject=subject, grade=grade)
-
-    # --- Try free local extraction first ---
-    local_text, page_count = _extract_pdf_text_local(pdf_bytes)
-
-    if _has_usable_text_layer(local_text, page_count):
-        logger.info(
-            "[Memo] %s | local text layer found (%d chars, %d pages) — "
-            "using cheap text call, skipping ai_document",
-            filename, len(local_text), page_count,
-        )
-        result = ai_json(
-            prompt + "\n\n--- MEMO TEXT ---\n" + local_text,
-            schema=MEMO_SCHEMA,
-        )
-    else:
-        logger.info(
-            "[Memo] %s | insufficient local text (%d chars, %d pages) — "
-            "falling back to ai_document (scanned/image PDF)",
-            filename, len(local_text), page_count,
-        )
-        result = ai_document(
-            pdf_bytes,
-            "application/pdf",
-            prompt,
-            schema=MEMO_SCHEMA,
-        )
-
-    answers = {}
-    for row in (result.get("answers") or []):
-        qn = _normalise_qnum(str(row.get("question_number", "")))
-        ans = (row.get("answer") or "").strip()
-        if qn and ans and qn not in answers:
-            answers[qn] = ans
-
-    logger.info("[Memo] %d answers extracted", len(answers))
-    return answers
-
-
 # ══════════════════════════════════════════════════════════════════════════════
 # SECURITY — CRIT-02: Prompt injection sanitization
 # ══════════════════════════════════════════════════════════════════════════════
@@ -848,41 +689,85 @@ def verify_request_token(req):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TIER LIMITS
+# DYNAMIC SEAT-BASED LIMITS & USAGE TRACKING
 # ══════════════════════════════════════════════════════════════════════════════
 # FIELD NAME MATTERS. Exam documents store upload time as an ISO STRING in
 # `uploadedAt`, not a Firestore timestamp in `createdAt`. ISO-8601 UTC strings
 # sort correctly, so string comparison is valid here.
-# tier_limits.count_school_usage() must query the SAME field, or the monthly
-# count returns zero and limits silently stop enforcing.
 # Composite index required: exams -> schoolId ASC, uploadedAt ASC
 
-TIER_EXAM_LIMITS = {
-    "free":     4,
-    "silver":   15,
-    "gold":     30,
-    "platinum": 80,
-    "diamond":  150,
-}
+# Default baseline limits per seat type if custom limits aren't set
+DEFAULT_EXAMS_PER_STUDENT = 2  # e.g., 2 exams generated per purchased student seat / month
+DEFAULT_EXAMS_PER_TEACHER = 2  # e.g., 10 exams generated per purchased teacher seat / month
+FREE_TIER_MONTHLY_LIMIT = 4  # Default limit for free/unpaid accounts
 
 
-def get_exam_limit(tier_id: str) -> int:
-    return TIER_EXAM_LIMITS.get(tier_id, TIER_EXAM_LIMITS["free"])
+def get_school_exam_limit(school_id: str) -> int:
+    """
+    Calculates monthly exam upload limit based on purchased seats
+    or returns custom/overridden limit if defined on the school/subscription document.
+    """
+    if not school_id:
+        return FREE_TIER_MONTHLY_LIMIT
+
+    try:
+        # Check active subscription seats
+        sub_doc = db.collection("subscriptions").document(school_id).get()
+
+        if sub_doc.exists:
+            sub_data = sub_doc.to_dict() or {}
+
+            # 1. Custom explicit limit override takes precedence if defined
+            if "customExamLimit" in sub_data:
+                return int(sub_data["customExamLimit"])
+
+            # 2. Dynamic seat-based calculation
+            if sub_data.get("status") == "active":
+                seats = sub_data.get("seats", {})
+                students = int(seats.get("students", 0))
+                teachers = int(seats.get("teachers", 0))
+
+                calculated_limit = (students * DEFAULT_EXAMS_PER_STUDENT) + (teachers * DEFAULT_EXAMS_PER_TEACHER)
+                return max(calculated_limit, FREE_TIER_MONTHLY_LIMIT)
+
+        # Fallback for unpaid/trial schools
+        return FREE_TIER_MONTHLY_LIMIT
+
+    except Exception as e:
+        logger.error("[Quota Check] Error calculating exam limit for school %s: %s", school_id, e)
+        return FREE_TIER_MONTHLY_LIMIT
 
 
 def _month_start_iso() -> str:
+    """Returns the ISO-8601 string for the 1st day of the current UTC month."""
     now = datetime.now(timezone.utc)
     return datetime(now.year, now.month, 1, tzinfo=timezone.utc).isoformat()
 
 
 def _count_month_uploads(school_id: str) -> int:
     """Exam uploads by this school in the current calendar month."""
-    return len(list(
-        db.collection("exams")
-          .where(filter=FieldFilter("schoolId", "==", school_id))
-          .where(filter=FieldFilter("uploadedAt", ">=", _month_start_iso()))
-          .stream()
-    ))
+    if not school_id:
+        return 0
+    try:
+        return len(list(
+            db.collection("exams")
+            .where(filter=FieldFilter("schoolId", "==", school_id))
+            .where(filter=FieldFilter("uploadedAt", ">=", _month_start_iso()))
+            .stream()
+        ))
+    except Exception as e:
+        logger.error("[Quota Check] Error counting month uploads for school %s: %s", school_id, e)
+        return 0
+
+
+def check_school_exam_quota(school_id: str) -> tuple[bool, int, int]:
+    """
+    Helper function to check if a school can upload more exams.
+    Returns: (can_upload: bool, used: int, limit: int)
+    """
+    limit = get_school_exam_limit(school_id)
+    used = _count_month_uploads(school_id)
+    return (used < limit), used, limit
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -894,6 +779,7 @@ app = Flask(__name__)
 # CRIT-05: cap inbound body size. Files go to Firebase Storage from the client,
 # so this endpoint only ever receives JSON metadata.
 app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024   # 5 MB
+app.register_blueprint(billing_bp)
 
 # ── CRIT-08: HTTPS enforcement — one guarded block, applied once ─────────────
 _backend_url = os.environ.get("BACKEND_BASE_URL", "")
@@ -1734,6 +1620,72 @@ def _load_exam_memos(exam_id: str) -> dict:
     return memos
 
 
+
+# =======================================================================
+# MIDDLEWARE / CHECKERS - PRICING MODELS
+# ======================================================================
+def check_can_add_user(school_id: str, user_role: str) -> tuple[bool, str]:
+    """
+    Verifies whether a school has available seat capacity for a new teacher or student.
+    """
+    sub_doc = db.collection("subscriptions").document(school_id).get()
+    if not sub_doc.exists:
+        return False, "No active subscription found for this school."
+
+    sub_data = sub_doc.to_dict() or {}
+    if sub_data.get("status") != "active":
+        return False, "School subscription is inactive or past due."
+
+    # Max purchased seats
+    purchased_seats = sub_data.get("seats", {}).get(f"{user_role}s", 0)
+
+    # Current active user count from Firestore
+    current_count = (
+        db.collection("users")
+        .where("schoolId", "==", school_id)
+        .where("role", "==", user_role)
+        .count()
+        .get()[0][0]
+        .value
+    )
+
+    if current_count >= purchased_seats:
+        return (
+            False,
+            f"{user_role.capitalize()} limit reached ({current_count}/{purchased_seats}). "
+            f"Please purchase additional {user_role} seats in the Principal Dashboard."
+        )
+
+    return True, "OK"
+
+
+def check_and_increment_exam_quota(school_id: str) -> tuple[bool, str]:
+    """
+    Checks if the school has available AI exam extraction capacity for the current month.
+    """
+    sub_ref = db.collection("subscriptions").document(school_id)
+    sub_snap = sub_ref.get()
+
+    if not sub_snap.exists:
+        return False, "No active subscription found."
+
+    sub = sub_snap.to_dict() or {}
+    quota = sub.get("aiQuota", {})
+
+    limit = quota.get("includedExamsPerMonth", 0) + (quota.get("purchasedAddonExams", 0))
+    used = quota.get("usedThisPeriod", 0)
+
+    if used >= limit:
+        return (
+            False,
+            f"Monthly AI exam limit reached ({used}/{limit}). "
+            f"Purchase an AI Exam Pack or wait until the next billing cycle."
+        )
+
+    # Atomically increment used count
+    sub_ref.update({"aiQuota.usedThisPeriod": fs_admin.Increment(1)})
+    return True, "OK"
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ROUTES
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1748,7 +1700,6 @@ def health():
         "provider": "gemini",
         "accepts":  sorted(ALLOWED_EXTS),
     })
-
 
 @app.route("/exams/upload", methods=["POST", "OPTIONS"])
 @limiter.limit("20 per hour")   # CRIT-01
@@ -1790,17 +1741,13 @@ def upload_exam():
         if not school_doc.exists:
             return jsonify({"error": "School not found"}), 404
 
-        tier_id = school_doc.to_dict().get("tier", "free")
-        exam_limit = get_exam_limit(tier_id)
-
-        # Authoritative monthly limit check
-        current_count = _count_month_uploads(school_id)
-        if current_count >= exam_limit:
+        # Authoritative monthly seat-based quota check
+        can_upload, current_count, exam_limit = check_school_exam_quota(school_id)
+        if not can_upload:
             return jsonify({
                 "error":   "limit_reached",
-                "message": (f"Monthly limit of {exam_limit} uploads reached on the "
-                            f"{tier_id.capitalize()} plan."),
-                "tier":  tier_id,
+                "message": (f"Monthly limit of {exam_limit} uploads reached for your "
+                            "current seat allocation. Please purchase additional seats to expand capacity."),
                 "limit": exam_limit,
                 "used":  current_count,
             }), 403
@@ -1849,7 +1796,7 @@ def upload_exam():
             "status":             "pending_extraction",
             "questionsExtracted": False,
             "memoMerged":         False,
-            # ISO string, not a timestamp — see the TIER LIMITS note above.
+            # ISO string, not a timestamp — see ISO-8601 UTC note above.
             "uploadedAt":         now.isoformat(),
             "extractedAt":        None,
         }
@@ -1885,9 +1832,9 @@ def upload_exam():
 
 
 @app.route("/exams/usage", methods=["GET", "OPTIONS"])
-@limiter.limit("60 per minute")   # CRIT-01
+@limiter.limit("60 per minute")  # CRIT-01
 def exam_usage():
-    """Monthly upload count against the school's tier limit."""
+    """Monthly upload count against the school's dynamic per-seat limit."""
     if request.method == "OPTIONS":
         return "", 204
     try:
@@ -1903,17 +1850,27 @@ def exam_usage():
         if not school_id:
             return jsonify({"error": "No school associated with this account"}), 400
 
-        school_doc = db.collection("schools").document(school_id).get()
-        tier_id = school_doc.to_dict().get("tier", "free") if school_doc.exists else "free"
-        exam_limit = get_exam_limit(tier_id)
+        # Retrieve dynamic seat limit & monthly usage
+        exam_limit = get_school_exam_limit(school_id)
         used = _count_month_uploads(school_id)
 
+        # Fetch subscription seat info for detailed status reporting
+        sub_doc = db.collection("subscriptions").document(school_id).get()
+        sub_data = sub_doc.to_dict() if sub_doc.exists else {}
+
+        status = sub_data.get("status", "unpaid")
+        billing_cycle = sub_data.get("billingCycle", "none")
+        seats = sub_data.get("seats", {"students": 0, "teachers": 0})
+
         return jsonify({
-            "tier":      tier_id,
-            "limit":     exam_limit,
-            "used":      used,
+            "schoolId": school_id,
+            "status": status,
+            "billingCycle": billing_cycle,
+            "seats": seats,
+            "limit": exam_limit,
+            "used": used,
             "remaining": max(0, exam_limit - used),
-            "atLimit":   used >= exam_limit,
+            "atLimit": used >= exam_limit,
         })
     except Exception:
         traceback.print_exc()
@@ -2346,7 +2303,8 @@ def register_user():
     if not school_id:
         return jsonify({"error": "No school associated with this account"}), 400
 
-    allowed, msg = check_school_limit(school_id, f"{role}s")
+    # Evaluate seat availability for the requested role
+    allowed, msg = check_school_limit(school_id, role)
     if not allowed:
         return jsonify({"error": "limit_reached", "message": msg}), 403
 
@@ -2356,16 +2314,14 @@ def register_user():
 @app.route("/check-tier-limit", methods=["POST", "OPTIONS"])
 def api_check_tier_limit():
     """
-    Advisory pre-check so the client can avoid pushing files to Storage that
-    would be rejected anyway. The write endpoints are authoritative.
+    Advisory pre-check so the client can avoid pushing files or registering users
+    if limits are reached. The write endpoints are authoritative.
 
       200 {"status": "allowed"}
       403 {"error": "limit_reached", ...}   -> block the action
       401 {"error": "invalid_token"}        -> re-auth
       503 {"error": "check_unavailable"}    -> client proceeds
     """
-    # Bare 204 so flask-cors' after_request hook attaches the headers;
-    # a jsonify() here can short-circuit it and break the preflight.
     if request.method == "OPTIONS":
         return "", 204
 
@@ -2637,6 +2593,8 @@ def api_extract_exam():
         return jsonify({"error": "Could not extract content from this file"}), 422
 
     return jsonify(result)
+
+
 
 @app.route("/admin/cleanup-sessions", methods=["POST"])
 @require_admin
