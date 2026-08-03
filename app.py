@@ -855,7 +855,7 @@ except ImportError:
 
 # ── Billing blueprint ─────────────────────────────────────────────────────────
 from billing_routes import billing_bp
-app.register_blueprint(billing_bp)
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════
