@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 
 # Reference Rates (in ZAR)
 RATES = {
-    "student_monthly": 72.0,
+    "student_monthly": 32.0,
     "teacher_monthly": 105.0,
     "base_platform_fee_monthly": 500.0,  # Minimum base subscription
     "extra_exam_pack_price": 150.0,  # e.g., R150 per 10 additional AI exam extractions
