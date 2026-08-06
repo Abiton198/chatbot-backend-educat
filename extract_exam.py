@@ -62,7 +62,7 @@ API_KEY = os.getenv("GEMINI_API_KEY")
 if not API_KEY:
     raise ValueError("GEMINI_API_KEY is not set.")
 
-MODEL_NAME = os.getenv("GEMINI_MODEL_EXTRACT", "gemini-2.5-flash")
+MODEL_NAME = os.getenv("GEMINI_MODEL_EXTRACT", "gemini-3.5-flash-lite")
 
 INPUT_FOLDER = os.getenv("INPUT_FOLDER", "processed")
 OUTPUT_FOLDER = "exams"

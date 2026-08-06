@@ -90,6 +90,7 @@ import threading
 import hashlib
 from groq import Groq
 from billing_routes import billing_bp
+from marking_service import create_rubric_cache, mark_student_submission
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("eduket")
@@ -1689,6 +1690,61 @@ def check_and_increment_exam_quota(school_id: str) -> tuple[bool, str]:
 # ══════════════════════════════════════════════════════════════════════════════
 # ROUTES
 # ══════════════════════════════════════════════════════════════════════════════
+# In-memory dictionary to store active cache names per memo/exam
+# Format: { "memo_cat_p1_2026": {"cache_name": "...", "expires_at": ...} }
+ACTIVE_RUBRIC_CACHES = {}
+
+@app.route("/api/marking/init-cache", methods=["POST"])
+def initialize_memo_cache():
+    """
+    Called ONCE before a batch marking session begins.
+    Uploads/caches the subject memo in Gemini for 2 hours.
+    """
+    data = request.get_json()
+    memo_id = data.get("memo_id")  # e.g., "CAT_GR12_NOV_P1"
+    memo_text = data.get("memo_text")  # Full text or extracted PDF contents
+
+    # Create the Gemini cache
+    cache = create_rubric_cache(
+        rubric_text=memo_text,
+        subject_name=data.get("subject", "General"),
+        ttl_minutes=120
+    )
+
+    # Store cache reference
+    ACTIVE_RUBRIC_CACHES[memo_id] = cache.name
+
+    return jsonify({
+        "status": "success",
+        "memo_id": memo_id,
+        "cache_name": cache.name,
+        "expires_at": str(cache.expire_time)
+    })
+
+
+@app.route("/api/marking/evaluate", methods=["POST"])
+def evaluate_student():
+    """
+    Called for EACH student script submission during marking.
+    Uses the cached memo tokens at a ~90% cost reduction.
+    """
+    data = request.get_json()
+    memo_id = data.get("memo_id")
+    student_id = data.get("student_id")
+    student_answers = data.get("student_answers")
+
+    cache_name = ACTIVE_RUBRIC_CACHES.get(memo_id)
+    if not cache_name:
+        return jsonify({"error": "No active cache found for this memo. Initialize cache first."}), 400
+
+    # Execute marking against the cached rubric
+    result_json = mark_student_submission(
+        cache_name=cache_name,
+        student_id=student_id,
+        student_answers=student_answers
+    )
+
+    return jsonify({"student_id": student_id, "evaluation": result_json})
 
 @app.route("/", methods=["GET"])
 def health():
