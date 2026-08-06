@@ -1271,7 +1271,9 @@ def run_extraction_pipeline(exam_id: str, meta: dict, school_id: str, subject_na
             return
 
         # 2. Extract Paper via Gemini (using local app.py implementation)
-        paper_meta, questions = extract_exam(exam_bytes, exam_fn, subject, grade)
+        paper_meta, sections, *rest = extract_exam("bytes", exam_bytes, subject, grade)
+        # If your Firestore builder expects a flat list of questions:
+        questions = [q for sec in sections for q in sec.questions]
 
         if not questions:
             raise ValueError(
