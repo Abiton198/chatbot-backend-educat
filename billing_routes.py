@@ -30,7 +30,7 @@ import firebase_admin
 from firebase_admin import firestore as fs_admin, auth as fb_auth
 
 # Import dynamic quote calculator engine
-from calculations import calculate_subscription_quote
+from pricing import calculate_subscription_quote
 
 logger     = logging.getLogger(__name__)
 billing_bp = Blueprint("billing", __name__)
