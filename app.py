@@ -1181,7 +1181,6 @@ def _subject_doc_ref(school_id: str, subject_name: str):
 # ══════════════════════════════════════════════════════════════════════════════
 # PIPELINE IMPLEMENTATION
 # ══════════════════════════════════════════════════════════════════════════════
-
 def run_extraction_pipeline(exam_id: str, meta: dict, school_id: str, subject_name: str):
     """
     Four stages:
@@ -1208,6 +1207,14 @@ def run_extraction_pipeline(exam_id: str, meta: dict, school_id: str, subject_na
             subject_ref.update({"uploads": uploads})
         except Exception as e:
             logger.warning("[Status] Update failed: %s", e)
+
+    def _get_field(obj, key, default=""):
+        """Safely fetch field values whether obj is a dataclass or a dict."""
+        if hasattr(obj, key):
+            return getattr(obj, key, default)
+        elif isinstance(obj, dict):
+            return obj.get(key, default)
+        return default
 
     try:
         # Check 1: Skip if this specific exam_id is already marked ready in Firestore
@@ -1238,7 +1245,6 @@ def run_extraction_pipeline(exam_id: str, meta: dict, school_id: str, subject_na
             )
 
         # Check 2: Deduplication via Content Hash
-        # Generate MD5 hash of raw file bytes to check if this exact file was processed before
         file_hash = hashlib.md5(exam_bytes).hexdigest()
         existing_matches = (
             db.collection("exams")
@@ -1254,7 +1260,6 @@ def run_extraction_pipeline(exam_id: str, meta: dict, school_id: str, subject_na
                 "[Pipeline] Duplicate file detected (Hash %s matching exam %s) — skipping AI extraction",
                 file_hash, existing_matches[0].id
             )
-            # Copy extracted data from the existing exam record directly
             db.collection("exams").document(exam_id).set({
                 **match_doc,
                 "title": title,
@@ -1270,18 +1275,21 @@ def run_extraction_pipeline(exam_id: str, meta: dict, school_id: str, subject_na
             set_status("ready", {"duplicatedFrom": existing_matches[0].id})
             return
 
-        # 2. Extract Paper via Gemini (using local app.py implementation)
+        # 2. Extract Paper via Gemini (extract_exam returns (metadata, sections, stats))
         paper_meta, sections, *rest = extract_exam("bytes", exam_bytes, subject, grade)
-        # If your Firestore builder expects a flat list of questions:
-        questions = [q for sec in sections for q in sec.questions]
+
+        # Flatten questions from section objects
+        questions = []
+        for sec in sections:
+            sec_qs = _get_field(sec, "questions", [])
+            questions.extend(sec_qs)
 
         if not questions:
             raise ValueError(
                 "No questions were found. Confirm the file is a complete exam paper."
             )
 
-        with_ctx = sum(1 for q in questions if
-                       (getattr(q, "parent_context", None) or (isinstance(q, dict) and q.get("parent_context"))))
+        with_ctx = sum(1 for q in questions if (_get_field(q, "parent_context", None) or "").strip())
         logger.info(
             "[Pipeline] %d questions extracted | %d carry source material",
             len(questions), with_ctx
@@ -1296,8 +1304,7 @@ def run_extraction_pipeline(exam_id: str, meta: dict, school_id: str, subject_na
 
         # Attach memo answers to questions
         for q in questions:
-            # Handle both dataclass instances and dictionaries
-            q_num = q.question_number if hasattr(q, "question_number") else q.get("question_number", "")
+            q_num = _get_field(q, "question_number", "")
             qn = _normalise_qnum(q_num)
 
             if qn and qn in memo_map:
@@ -1307,40 +1314,33 @@ def run_extraction_pipeline(exam_id: str, meta: dict, school_id: str, subject_na
                 elif isinstance(q, dict) and not q.get("memo"):
                     q["memo"] = memo_map[qn]
 
-        # 4a. Top-level exam document
+        # 4a. Build section index and top-level exam document
         sections_index = []
         seen_sections = set()
 
-        for q in questions:
-            # Handle both dataclass instances and dicts safely
-            sec_name = getattr(q, "section", None) or (q.get("section") if isinstance(q, dict) else "A") or "A"
-
+        for sec in sections:
+            sec_name = _get_field(sec, "section", "A") or "A"
             if sec_name in seen_sections:
                 continue
             seen_sections.add(sec_name)
 
-            sec_title = getattr(q, "section_title", None) or (
-                q.get("section_title") if isinstance(q, dict) else "") or ""
-            sec_inst = getattr(q, "section_instructions", None) or (
-                q.get("section_instructions") if isinstance(q, dict) else "") or ""
-
             sections_index.append({
                 "section": sec_name,
-                "title": sec_title,
-                "instructions": sec_inst,
+                "title": _get_field(sec, "section_title", "") or "",
+                "instructions": _get_field(sec, "section_instructions", "") or "",
             })
 
         db.collection("exams").document(exam_id).set({
             "title": title,
             "subject": subject,
             "grade": grade,
-            "year": meta.get("year", "") or paper_meta.get("year", ""),
+            "year": meta.get("year", "") or _get_field(paper_meta, "year", ""),
             "curriculum": meta.get("curriculum", "CAPS"),
-            "paperNumber": paper_meta.get("paper_number", ""),
-            "examTypeDetected": paper_meta.get("exam_type", ""),
-            "paperTotalMarks": paper_meta.get("total_marks"),
-            "timeAllocation": paper_meta.get("time_allocation", ""),
-            "paperInstructions": paper_meta.get("instructions", ""),
+            "paperNumber": _get_field(paper_meta, "paper_number", ""),
+            "examTypeDetected": _get_field(paper_meta, "exam_type", ""),
+            "paperTotalMarks": _get_field(paper_meta, "total_marks", None),
+            "timeAllocation": _get_field(paper_meta, "time_allocation", ""),
+            "paperInstructions": _get_field(paper_meta, "instructions", ""),
             "sections": sections_index,
             "teacherName": meta.get("teacherName", ""),
             "uploadedBy": meta.get("uploadedBy", ""),
@@ -1356,7 +1356,7 @@ def run_extraction_pipeline(exam_id: str, meta: dict, school_id: str, subject_na
             "status": "ready",
             "totalQuestions": len(questions),
             "questionsWithContext": with_ctx,
-            "fileHash": file_hash,  # Saved for future duplicate detection
+            "fileHash": file_hash,
             "extractedAt": fs_admin.SERVER_TIMESTAMP,
             "sourceUploadId": exam_id,
         }, merge=True)
@@ -1366,42 +1366,31 @@ def run_extraction_pipeline(exam_id: str, meta: dict, school_id: str, subject_na
         written = 0
 
         for i, q in enumerate(questions):
-            # Access attributes safely whether q is a dataclass or dict
-            qtext = str(getattr(q, "question", "") or (q.get("question") if isinstance(q, dict) else "")).strip()
+            qtext = str(_get_field(q, "question", "")).strip()
             if not qtext:
                 continue
 
             ref = db.collection("exam_questions").document(f"{exam_id}_{i:04d}")
             batch.set(ref, {
                 "examId": exam_id,
-                "questionNumber": str(getattr(q, "question_number", None) or (
-                    q.get("question_number") if isinstance(q, dict) else i + 1)),
-                "parentQuestion": getattr(q, "parent_question", "") or (
-                    q.get("parent_question", "") if isinstance(q, dict) else ""),
-                "parentContext": getattr(q, "parent_context", None) or (
-                    q.get("parent_context") if isinstance(q, dict) else None),
-                "section": getattr(q, "section", "A") or (q.get("section", "A") if isinstance(q, dict) else "A"),
-                "sectionTitle": getattr(q, "section_title", "") or (
-                    q.get("section_title", "") if isinstance(q, dict) else ""),
-                "sectionInstructions": getattr(q, "section_instructions", "") or (
-                    q.get("section_instructions", "") if isinstance(q, dict) else ""),
-                "instructions": getattr(q, "instructions", "") or (
-                    q.get("instructions", "") if isinstance(q, dict) else ""),
+                "questionNumber": str(_get_field(q, "question_number", i + 1)),
+                "parentQuestion": _get_field(q, "parent_question", ""),
+                "parentContext": _get_field(q, "parent_context", None),
+                "section": _get_field(q, "section", "A"),
+                "sectionTitle": _get_field(q, "section_title", ""),
+                "sectionInstructions": _get_field(q, "section_instructions", ""),
+                "instructions": _get_field(q, "instructions", ""),
                 "questionText": qtext,
-                "type": getattr(q, "question_type", "open") or (
-                    q.get("type", "open") if isinstance(q, dict) else "open"),
-                "marks": getattr(q, "marks", 1) or (q.get("marks", 1) if isinstance(q, dict) else 1),
-                "options": getattr(q, "options", None) or (q.get("options") if isinstance(q, dict) else None),
-                "columnA": getattr(q, "column_a", None) or (q.get("column_a") if isinstance(q, dict) else None),
-                "columnB": getattr(q, "column_b", None) or (q.get("column_b") if isinstance(q, dict) else None),
-                "questionTable": getattr(q, "table_markdown", None) or (
-                    q.get("table_markdown") if isinstance(q, dict) else None),
-                "questionLatex": getattr(q, "formula", None) or (q.get("latex") if isinstance(q, dict) else None),
-                "hasVisual": bool(
-                    getattr(q, "has_visual", False) or (q.get("has_visual") if isinstance(q, dict) else False)),
-                "visualDescription": getattr(q, "visual_description", None) or (
-                    q.get("visual_description") if isinstance(q, dict) else None),
-                "memo": str(getattr(q, "memo", "") or (q.get("memo", "") if isinstance(q, dict) else "")),
+                "type": _get_field(q, "question_type", "open"),
+                "marks": _get_field(q, "marks", 1),
+                "options": _get_field(q, "options", None),
+                "columnA": _get_field(q, "column_a", None),
+                "columnB": _get_field(q, "column_b", None),
+                "questionTable": _get_field(q, "table_markdown", None),
+                "questionLatex": _get_field(q, "formula", None),
+                "hasVisual": bool(_get_field(q, "has_visual", False)),
+                "visualDescription": _get_field(q, "visual_description", None),
+                "memo": str(_get_field(q, "memo", "")),
                 "order": i,
             })
             written += 1
