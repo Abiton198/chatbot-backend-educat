@@ -1,5 +1,5 @@
 """
-billing_routes.py — Eduket OS Billing & Subscription API v4.0 (Per-Seat Pricing)
+billing_routes.py — EduCAT Billing & Subscription API v4.0 (Dynamic Per-Seat Pricing)
 ═══════════════════════════════════════════════════════════════════════════════
 Registered in app.py:
     from billing_routes import billing_bp
@@ -29,6 +29,9 @@ from flask import Blueprint, request, jsonify
 import firebase_admin
 from firebase_admin import firestore as fs_admin, auth as fb_auth
 
+# Import dynamic quote calculator engine
+from calculations import calculate_subscription_quote
+
 logger     = logging.getLogger(__name__)
 billing_bp = Blueprint("billing", __name__)
 
@@ -42,44 +45,25 @@ PAYFAST_MERCHANT_KEY = os.getenv("PAYFAST_MERCHANT_KEY", "").strip()
 PAYFAST_PASSPHRASE   = os.getenv("PAYFAST_PASSPHRASE",   "").strip()
 
 if not all([PAYFAST_MERCHANT_ID, PAYFAST_MERCHANT_KEY]):
-    raise RuntimeError(
-        "Missing PayFast credentials. Set PAYFAST_MERCHANT_ID and "
-        "PAYFAST_MERCHANT_KEY in your environment variables."
+    logger.warning(
+        "PayFast credentials missing in environment. "
+        "Set PAYFAST_MERCHANT_ID and PAYFAST_MERCHANT_KEY for live transactions."
     )
 
 FRONTEND_BASE_URL = os.environ.get(
-    "FRONTEND_BASE_URL", "https://eduket.tech"
+    "FRONTEND_BASE_URL", "https://educat.tech"
 ).rstrip("/")
 
 BACKEND_BASE_URL = os.environ.get(
     "BACKEND_BASE_URL", "https://chatbot-backend-educat.onrender.com"
 ).rstrip("/")
 
-# PayFast known IP ranges
+# PayFast known IP ranges for verification
 PAYFAST_IPS = {
     "197.97.145.144", "197.97.145.145", "197.97.145.146", "197.97.145.147",
     "197.97.145.148", "197.97.145.149", "197.97.145.150", "197.97.145.151",
     "41.74.179.194",  "41.74.179.195",  "41.74.179.196",  "41.74.179.197",
     "197.97.144.128",
-}
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PER-SEAT RATES & CYCLE CONFIG (in ZAR)
-# ══════════════════════════════════════════════════════════════════════════════
-
-CYCLE_CONFIG = {
-    "monthly":   {"months": 1,  "discount": 0.00},  # Standard rate
-    "quarterly": {"months": 3,  "discount": 0.05},  # 5% discount
-    "annual":    {"months": 12, "discount": 0.10},  # 10% discount
-}
-
-RATES = {
-    "student_monthly": 72.0,
-    "teacher_monthly": 105.0,
-    "base_platform_fee_monthly": 500.0,
-    "extra_exam_pack_price": 150.0,
-    "extra_exam_pack_size": 10,
 }
 
 
@@ -109,8 +93,10 @@ def _get_school_id_for_uid(uid: str):
         logger.error("[Billing] schoolId lookup failed for %s: %s", uid, e)
         return None
 
-def _audit(action: str, actor: str, target: str, details: dict = {}):
+def _audit(action: str, actor: str, target: str, details: dict = None):
     try:
+        if details is None:
+            details = {}
         _db().collection("auditLog").add({
             "action":    action,
             "actorUid":  actor,
@@ -123,47 +109,6 @@ def _audit(action: str, actor: str, target: str, details: dict = {}):
         })
     except Exception as e:
         logger.error("[Audit] Billing log failed: %s", e)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PRICING CALCULATION ENGINE
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _calculate_per_seat_price(students: int, teachers: int, cycle: str, additional_exam_packs: int = 0) -> dict:
-    """
-    Computes total subscription price for students & teachers with cycle discounts,
-    plus optional one-time AI exam-pack addons (not subject to cycle discount).
-    """
-    config   = CYCLE_CONFIG.get(cycle, CYCLE_CONFIG["annual"])
-    months   = config["months"]
-    discount = config["discount"]
-
-    monthly_students = students * RATES["student_monthly"]
-    monthly_teachers = teachers * RATES["teacher_monthly"]
-    monthly_base     = RATES["base_platform_fee_monthly"]
-
-    monthly_subtotal = monthly_base + monthly_students + monthly_teachers
-    period_subtotal  = monthly_subtotal * months
-
-    discount_amount = period_subtotal * discount
-    period_total     = period_subtotal - discount_amount
-
-    addon_cost = additional_exam_packs * RATES["extra_exam_pack_price"]
-    total_due  = period_total + addon_cost
-
-    return {
-        "students": students,
-        "teachers": teachers,
-        "billingCycle": cycle,
-        "months": months,
-        "discountPercent": int(discount * 100),
-        "additionalExamPacks": additional_exam_packs,
-        "addonExamPacksCost": round(addon_cost, 2),
-        "monthlyEquivalent": round(total_due / months, 2),
-        "subtotalBeforeDiscount": round(period_subtotal, 2),
-        "discountAmount": round(discount_amount, 2),
-        "totalDueZar": round(total_due, 2)
-    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -198,7 +143,7 @@ def _verify_payfast_signature(data: dict) -> bool:
 
 @billing_bp.route("/api/billing/quote", methods=["POST", "OPTIONS"])
 def billing_quote():
-    """Return price quote based on requested student and teacher seats."""
+    """Returns dynamic price quote based on requested student and teacher seats."""
     if request.method == "OPTIONS":
         return "", 204
     try:
@@ -209,19 +154,25 @@ def billing_quote():
         data                  = request.get_json() or {}
         students              = int(data.get("students", 0))
         teachers              = int(data.get("teachers", 0))
-        billing_cycle         = data.get("billingCycle", "annual").lower()
+        billing_cycle         = str(data.get("billingCycle", "monthly")).lower()
         additional_exam_packs = int(data.get("additionalExamPacks", 0))
 
         if students < 0 or teachers < 0:
             return jsonify({"error": "Student and teacher seats must be non-negative"}), 400
         if additional_exam_packs < 0:
             return jsonify({"error": "Additional exam packs must be non-negative"}), 400
-        if billing_cycle not in CYCLE_CONFIG:
-            return jsonify({"error": "Invalid billingCycle"}), 400
 
-        quote = _calculate_per_seat_price(students, teachers, billing_cycle, additional_exam_packs)
+        quote = calculate_subscription_quote(
+            students=students,
+            teachers=teachers,
+            cycle=billing_cycle,
+            additional_exam_packs=additional_exam_packs
+        )
+
         return jsonify(quote), 200
 
+    except ValueError as ve:
+        return jsonify({"error": str(ve)}), 400
     except Exception:
         traceback.print_exc()
         return jsonify({"error": "Could not calculate price quote."}), 500
@@ -230,8 +181,10 @@ def billing_quote():
 # ══════════════════════════════════════════════════════════════════════════════
 # ROUTE: Initiate Per-Seat Payment
 # ══════════════════════════════════════════════════════════════════════════════
+
 @billing_bp.route("/api/billing/initiate", methods=["POST", "OPTIONS"])
 def billing_initiate():
+    """Creates pending payment transaction and generates signed PayFast checkout form payloads."""
     if request.method == "OPTIONS":
         return "", 204
     try:
@@ -242,24 +195,31 @@ def billing_initiate():
         data                  = request.get_json() or {}
         students              = int(data.get("students", 0))
         teachers              = int(data.get("teachers", 0))
-        billing_cycle         = data.get("billingCycle", "annual").lower()
+        billing_cycle         = str(data.get("billingCycle", "monthly")).lower()
         additional_exam_packs = int(data.get("additionalExamPacks", 0))
 
-        if students <= 0 or teachers <= 0:
-            return jsonify({"error": "Must purchase at least 1 student and 1 teacher seat."}), 400
+        if students < 0 or teachers < 0:
+            return jsonify({"error": "Student and teacher seats must be non-negative"}), 400
         if additional_exam_packs < 0:
             return jsonify({"error": "Additional exam packs must be non-negative"}), 400
-        if billing_cycle not in CYCLE_CONFIG:
-            return jsonify({"error": "Invalid billingCycle"}), 400
 
         school_id = _get_school_id_for_uid(uid)
         if not school_id:
             return jsonify({"error": "No school associated with this account"}), 400
 
-        quote = _calculate_per_seat_price(students, teachers, billing_cycle, additional_exam_packs)
-        payment_id = f"EDUKET_{school_id[:8].upper()}_{uuid.uuid4().hex[:8].upper()}"
+        quote = calculate_subscription_quote(
+            students=students,
+            teachers=teachers,
+            cycle=billing_cycle,
+            additional_exam_packs=additional_exam_packs
+        )
 
-        item_name = f"Eduket Subscription ({students} Students, {teachers} Teachers)"
+        if quote["is_free_baseline"] and additional_exam_packs == 0:
+            return jsonify({"error": "Requested allocation matches free baseline. No checkout required."}), 400
+
+        payment_id = f"EDUCAT_{school_id[:8].upper()}_{uuid.uuid4().hex[:8].upper()}"
+
+        item_name = f"EduCAT Subscription ({students} Students, {teachers} Teachers)"
         if additional_exam_packs > 0:
             item_name += f" + {additional_exam_packs} Exam Pack(s)"
 
@@ -270,9 +230,9 @@ def billing_initiate():
             "cancel_url":       f"{FRONTEND_BASE_URL}/payment/cancel",
             "notify_url":       f"{BACKEND_BASE_URL}/api/payfast/itn",
             "m_payment_id":     payment_id,
-            "amount":           f"{quote['totalDueZar']:.2f}",
+            "amount":           f"{quote['total_due_now']:.2f}",
             "item_name":        item_name,
-            "item_description": f"{billing_cycle.capitalize()} Plan ({quote['months']} months)",
+            "item_description": f"{billing_cycle.capitalize()} Plan ({quote['months']} month duration)",
             "custom_str1":      school_id,
             "custom_str2":      str(students),
             "custom_str3":      str(teachers),
@@ -282,7 +242,7 @@ def billing_initiate():
 
         payment_data["signature"] = _generate_payfast_signature(payment_data)
 
-        # Record pending transaction
+        # Record pending transaction in Firestore
         _db().collection("paymentTransactions").document(payment_id).set({
             "schoolId":             school_id,
             "uid":                  uid,
@@ -290,15 +250,17 @@ def billing_initiate():
             "teachers":             teachers,
             "billingCycle":         billing_cycle,
             "additionalExamPacks":  additional_exam_packs,
-            "expectedAmount":       quote["totalDueZar"],
+            "expectedAmount":       quote["total_due_now"],
             "status":               "pending",
             "createdAt":            fs_admin.SERVER_TIMESTAMP,
         })
 
         _audit("payment_initiated", uid, school_id, {
-            "students": students, "teachers": teachers,
+            "students": students,
+            "teachers": teachers,
             "additionalExamPacks": additional_exam_packs,
-            "amount": quote["totalDueZar"], "payment_id": payment_id,
+            "amount": quote["total_due_now"],
+            "payment_id": payment_id,
         })
 
         return jsonify({
@@ -307,6 +269,8 @@ def billing_initiate():
             "quote":       quote
         }), 200
 
+    except ValueError as ve:
+        return jsonify({"error": str(ve)}), 400
     except Exception:
         traceback.print_exc()
         return jsonify({"error": "Could not initiate payment."}), 500
@@ -318,6 +282,7 @@ def billing_initiate():
 
 @billing_bp.route("/api/payfast/itn", methods=["POST"])
 def payfast_itn():
+    """Webhook callback triggered by PayFast on payment status updates."""
     try:
         itn_data = request.form.to_dict(flat=True)
 
@@ -357,10 +322,10 @@ def payfast_itn():
             return "", 200  # Already processed
 
         school_id = tx.get("schoolId", "")
-        students = tx.get("students", 0)
-        teachers = tx.get("teachers", 0)
-        billing_cycle = tx.get("billingCycle", "annual")
-        additional_exam_packs = tx.get("additionalExamPacks", 0)
+        students = int(tx.get("students", 0))
+        teachers = int(tx.get("teachers", 0))
+        billing_cycle = str(tx.get("billingCycle", "monthly")).lower()
+        additional_exam_packs = int(tx.get("additionalExamPacks", 0))
 
         paid_amount     = float(itn_data.get("amount_gross", 0))
         expected_amount = float(tx.get("expectedAmount", 0))
@@ -369,12 +334,14 @@ def payfast_itn():
             tx_ref.set({"status": "amount_mismatch", "paidAmount": paid_amount}, merge=True)
             return "", 200
 
-        # Success - Calculate billing end date
-        months_to_add = CYCLE_CONFIG.get(billing_cycle, {}).get("months", 12)
-        now           = datetime.now(timezone.utc)
-        period_end    = now + timedelta(days=months_to_add * 30)
+        # Calculate billing period end date based on cycle
+        cycle_months_map = {"monthly": 1, "quarterly": 3, "yearly": 12, "annual": 12}
+        months_to_add = cycle_months_map.get(billing_cycle, 1)
 
-        # Update school subscription details
+        now        = datetime.now(timezone.utc)
+        period_end = now + timedelta(days=months_to_add * 30)
+
+        # Provision updated school subscription
         batch = db.batch()
 
         sub_ref = db.collection("subscriptions").document(school_id)
@@ -386,8 +353,7 @@ def payfast_itn():
                 "students": students,
                 "teachers": teachers
             },
-            "additionalExamPacks": fs_admin.Increment(
-                additional_exam_packs) if additional_exam_packs else additional_exam_packs,
+            "additionalExamPacks": fs_admin.Increment(additional_exam_packs) if additional_exam_packs else additional_exam_packs,
             "currentPeriodStart": now.isoformat(),
             "currentPeriodEnd": period_end.isoformat(),
             "pfPaymentId": pf_payment_id,
@@ -404,12 +370,14 @@ def payfast_itn():
         batch.commit()
 
         _audit("seats_upgraded", "payfast_itn", school_id, {
-            "students": students, "teachers": teachers, "amount": paid_amount
+            "students": students,
+            "teachers": teachers,
+            "amount": paid_amount
         })
 
         logger.info("[ITN] ✓ School %s provisioned with %d students / %d teachers", school_id, students, teachers)
         return "", 200
 
-    except Exception as e:
+    except Exception:
         traceback.print_exc()
         return "", 500

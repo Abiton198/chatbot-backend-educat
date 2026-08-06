@@ -17,12 +17,14 @@ log = logging.getLogger(__name__)
 
 FIRESTORE_TIMEOUT = 8.0
 
-# ── Baseline Quotas Per Seat ──────────────────────────────────────────────────
-DEFAULT_EXAMS_PER_STUDENT = 2  # Monthly exam upload quota per purchased student seat
-DEFAULT_EXAMS_PER_TEACHER = 2  # Monthly exam upload quota per purchased teacher seat
-FREE_TIER_MONTHLY_LIMIT = 4  # Free/trial tier default monthly exam upload quota
+# ── Baseline Allocations & Quotas ────────────────────────────────────────────
+FREE_STUDENT_BASE = 10  # Included free student baseline
+FREE_TEACHER_BASE = 2   # Included free teacher baseline
 
-# Exams are scoped to the current calendar month; headcounts are standing total seats
+DEFAULT_EXAMS_PER_TEACHER = 50  # Monthly exam quota generated per teacher seat
+FREE_TIER_MONTHLY_LIMIT = 100   # Free/trial tier baseline monthly upload quota
+
+# Exams are scoped to the current UTC calendar month; headcounts are standing total seats
 MONTHLY_SCOPED = {"exams", "exam"}
 
 # ── Lazy Per-Process Firestore Client ─────────────────────────────────────────
@@ -56,20 +58,21 @@ def _count(query) -> int:
         return sum(1 for _ in query.stream(timeout=FIRESTORE_TIMEOUT))
 
 
-def _month_start_iso() -> str:
+def _get_month_bounds():
     """
-    Returns the ISO-8601 string for the 1st day of the current UTC month.
-    Exams store `uploadedAt` as an ISO string, enabling fast string filter queries.
+    Returns (iso_string, datetime_obj) for the 1st day of current UTC month.
+    Supports querying whether uploadedAt is stored as string or Timestamp.
     """
     now = datetime.now(timezone.utc)
-    return datetime(now.year, now.month, 1, tzinfo=timezone.utc).isoformat()
+    start_dt = datetime(now.year, now.month, 1, tzinfo=timezone.utc)
+    return start_dt.isoformat(), start_dt
 
 
 # ── Dynamic Limit Calculation Engine ─────────────────────────────────────────
 
 def get_school_exam_limit(school_id: str) -> int:
     """
-    Calculates monthly exam upload limit based on active purchased seats
+    Calculates monthly exam upload limit based on teacher headcount / seat allocations
     or returns custom/overridden limit if set on the school subscription.
     """
     if not school_id:
@@ -83,17 +86,15 @@ def get_school_exam_limit(school_id: str) -> int:
             sub_data = sub_doc.to_dict() or {}
 
             # 1. Custom explicit limit override takes precedence if set
-            if "customExamLimit" in sub_data:
+            if "customExamLimit" in sub_data and sub_data["customExamLimit"] is not None:
                 return int(sub_data["customExamLimit"])
 
             # 2. Seat-based dynamic calculation
-            if sub_data.get("status") == "active":
-                seats = sub_data.get("seats", {})
-                students = int(seats.get("students", 0))
-                teachers = int(seats.get("teachers", 0))
+            seats = sub_data.get("seats", {})
+            teachers = int(seats.get("teachers", FREE_TEACHER_BASE))
 
-                calculated_limit = (students * DEFAULT_EXAMS_PER_STUDENT) + (teachers * DEFAULT_EXAMS_PER_TEACHER)
-                return max(calculated_limit, FREE_TIER_MONTHLY_LIMIT)
+            calculated_limit = teachers * DEFAULT_EXAMS_PER_TEACHER
+            return max(calculated_limit, FREE_TIER_MONTHLY_LIMIT)
 
         return FREE_TIER_MONTHLY_LIMIT
 
@@ -118,9 +119,11 @@ def count_school_usage(school_id: str, resource: str) -> int:
     res = resource.lower().rstrip("s")
 
     if res == "exam":
+        iso_start, dt_start = _get_month_bounds()
+        # Filter for current month exams
         q = (db.collection("exams")
              .where(filter=FieldFilter("schoolId", "==", school_id))
-             .where(filter=FieldFilter("uploadedAt", ">=", _month_start_iso())))
+             .where(filter=FieldFilter("uploadedAt", ">=", iso_start)))
         return _count(q)
 
     # For 'teacher' or 'student' headcounts
@@ -161,18 +164,17 @@ def check_school_limit(school_id: str, limit_type: str) -> tuple[bool, str]:
         log.error("[Limit Check] Subscription lookup failed for school %s: %s", school_id, e)
         return False, "Unable to verify school subscription status."
 
-    status = sub_data.get("status", "unpaid")
+    status = sub_data.get("status", "free")
     seats = sub_data.get("seats", {})
-    purchased_students = int(seats.get("students", 0))
-    purchased_teachers = int(seats.get("teachers", 0))
+
+    # Use purchased seat numbers if present; fall back to free baseline allocations
+    purchased_students = int(seats.get("students", FREE_STUDENT_BASE))
+    purchased_teachers = int(seats.get("teachers", FREE_TEACHER_BASE))
 
     # --------------------------------------------------------------------------
     # CHECK 1: Teacher Registration Seats
     # --------------------------------------------------------------------------
     if res == "teacher":
-        if status != "active" and purchased_teachers == 0:
-            return False, "Active subscription required to register teachers."
-
         teacher_count = count_school_usage(school_id, "teachers")
 
         if teacher_count >= purchased_teachers:
@@ -184,9 +186,6 @@ def check_school_limit(school_id: str, limit_type: str) -> tuple[bool, str]:
     # CHECK 2: Student Registration Seats
     # --------------------------------------------------------------------------
     elif res == "student":
-        if status != "active" and purchased_students == 0:
-            return False, "Active subscription required to register students."
-
         student_count = count_school_usage(school_id, "students")
 
         if student_count >= purchased_students:
