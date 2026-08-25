@@ -1,15 +1,6 @@
 """
-billing_routes.py — EduCAT Billing & Subscription API v4.0 (Dynamic Per-Seat Pricing)
+billing_routes.py — EduCAT Billing & Subscription API v4.1 (School & Parent Subscriptions)
 ═══════════════════════════════════════════════════════════════════════════════
-Registered in app.py:
-    from billing_routes import billing_bp
-    app.register_blueprint(billing_bp)
-
-Routes
-──────
-    POST /api/billing/quote       Dynamic per-seat price quote (students, teachers, cycle)
-    POST /api/billing/initiate    Create pending transaction + PayFast form data
-    POST /api/payfast/itn         PayFast ITN webhook (updates purchased seats on payment)
 """
 
 from dotenv import load_dotenv
@@ -51,7 +42,7 @@ if not all([PAYFAST_MERCHANT_ID, PAYFAST_MERCHANT_KEY]):
     )
 
 FRONTEND_BASE_URL = os.environ.get(
-    "FRONTEND_BASE_URL", "https://educat.tech"
+    "FRONTEND_BASE_URL", "https://eduket.tech"
 ).rstrip("/")
 
 BACKEND_BASE_URL = os.environ.get(
@@ -138,12 +129,11 @@ def _verify_payfast_signature(data: dict) -> bool:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ROUTE: Dynamic Price Quote
+# ROUTE: Price Quote (Supports 'school' and 'parent')
 # ══════════════════════════════════════════════════════════════════════════════
 
 @billing_bp.route("/api/billing/quote", methods=["POST", "OPTIONS"])
 def billing_quote():
-    """Returns dynamic price quote based on requested student and teacher seats."""
     if request.method == "OPTIONS":
         return "", 204
     try:
@@ -152,6 +142,7 @@ def billing_quote():
             return err
 
         data                  = request.get_json() or {}
+        plan_type             = str(data.get("type") or data.get("plan") or "school").lower()
         students              = int(data.get("students", 0))
         teachers              = int(data.get("teachers", 0))
         billing_cycle         = str(data.get("billingCycle", "monthly")).lower()
@@ -166,7 +157,8 @@ def billing_quote():
             students=students,
             teachers=teachers,
             cycle=billing_cycle,
-            additional_exam_packs=additional_exam_packs
+            additional_exam_packs=additional_exam_packs,
+            plan_type=plan_type
         )
 
         return jsonify(quote), 200
@@ -179,12 +171,11 @@ def billing_quote():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ROUTE: Initiate Per-Seat Payment
+# ROUTE: Initiate Payment (Supports 'school' and 'parent')
 # ══════════════════════════════════════════════════════════════════════════════
 
 @billing_bp.route("/api/billing/initiate", methods=["POST", "OPTIONS"])
 def billing_initiate():
-    """Creates pending payment transaction and generates signed PayFast checkout form payloads."""
     if request.method == "OPTIONS":
         return "", 204
     try:
@@ -193,35 +184,39 @@ def billing_initiate():
             return err
 
         data                  = request.get_json() or {}
+        plan_type             = str(data.get("type") or data.get("plan") or "school").lower()
+        is_parent             = plan_type in ["parent", "parent_access"]
         students              = int(data.get("students", 0))
         teachers              = int(data.get("teachers", 0))
         billing_cycle         = str(data.get("billingCycle", "monthly")).lower()
         additional_exam_packs = int(data.get("additionalExamPacks", 0))
 
-        if students < 0 or teachers < 0:
-            return jsonify({"error": "Student and teacher seats must be non-negative"}), 400
-        if additional_exam_packs < 0:
-            return jsonify({"error": "Additional exam packs must be non-negative"}), 400
-
-        school_id = _get_school_id_for_uid(uid)
-        if not school_id:
-            return jsonify({"error": "No school associated with this account"}), 400
+        school_id = None
+        if not is_parent:
+            school_id = _get_school_id_for_uid(uid)
+            if not school_id:
+                return jsonify({"error": "No school associated with this account"}), 400
 
         quote = calculate_subscription_quote(
             students=students,
             teachers=teachers,
             cycle=billing_cycle,
-            additional_exam_packs=additional_exam_packs
+            additional_exam_packs=additional_exam_packs,
+            plan_type=plan_type
         )
 
-        if quote["is_free_baseline"] and additional_exam_packs == 0:
+        if not is_parent and quote.get("is_free_baseline") and additional_exam_packs == 0:
             return jsonify({"error": "Requested allocation matches free baseline. No checkout required."}), 400
 
-        payment_id = f"EDUCAT_{school_id[:8].upper()}_{uuid.uuid4().hex[:8].upper()}"
+        target_prefix = "PARENT" if is_parent else f"SCHOOL_{school_id[:8].upper()}"
+        payment_id = f"EDUCAT_{target_prefix}_{uuid.uuid4().hex[:8].upper()}"
 
-        item_name = f"EduCAT Subscription ({students} Students, {teachers} Teachers)"
-        if additional_exam_packs > 0:
-            item_name += f" + {additional_exam_packs} Exam Pack(s)"
+        if is_parent:
+            item_name = f"Parent Portal Access ({billing_cycle.capitalize()})"
+        else:
+            item_name = f"EduCAT Subscription ({students} Students, {teachers} Teachers)"
+            if additional_exam_packs > 0:
+                item_name += f" + {additional_exam_packs} Exam Pack(s)"
 
         payment_data = {
             "merchant_id":      PAYFAST_MERCHANT_ID,
@@ -233,17 +228,18 @@ def billing_initiate():
             "amount":           f"{quote['total_due_now']:.2f}",
             "item_name":        item_name,
             "item_description": f"{billing_cycle.capitalize()} Plan ({quote['months']} month duration)",
-            "custom_str1":      school_id,
-            "custom_str2":      str(students),
-            "custom_str3":      str(teachers),
-            "custom_str4":      billing_cycle,
-            "custom_str5":      str(additional_exam_packs),
+            "custom_str1":      "parent" if is_parent else school_id,
+            "custom_str2":      uid if is_parent else str(students),
+            "custom_str3":      billing_cycle if is_parent else str(teachers),
+            "custom_str4":      "" if is_parent else billing_cycle,
+            "custom_str5":      "" if is_parent else str(additional_exam_packs),
         }
 
         payment_data["signature"] = _generate_payfast_signature(payment_data)
 
         # Record pending transaction in Firestore
         _db().collection("paymentTransactions").document(payment_id).set({
+            "targetType":           "parent" if is_parent else "school",
             "schoolId":             school_id,
             "uid":                  uid,
             "students":             students,
@@ -255,10 +251,9 @@ def billing_initiate():
             "createdAt":            fs_admin.SERVER_TIMESTAMP,
         })
 
-        _audit("payment_initiated", uid, school_id, {
-            "students": students,
-            "teachers": teachers,
-            "additionalExamPacks": additional_exam_packs,
+        _audit("payment_initiated", uid, uid if is_parent else school_id, {
+            "targetType": "parent" if is_parent else "school",
+            "billingCycle": billing_cycle,
             "amount": quote["total_due_now"],
             "payment_id": payment_id,
         })
@@ -277,12 +272,11 @@ def billing_initiate():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ROUTE: PayFast ITN Webhook (Provisions Seat Allocations)
+# ROUTE: PayFast ITN Webhook (Handles School & Parent Provisioning)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @billing_bp.route("/api/payfast/itn", methods=["POST"])
 def payfast_itn():
-    """Webhook callback triggered by PayFast on payment status updates."""
     try:
         itn_data = request.form.to_dict(flat=True)
 
@@ -321,12 +315,6 @@ def payfast_itn():
         if tx.get("status") == "complete":
             return "", 200  # Already processed
 
-        school_id = tx.get("schoolId", "")
-        students = int(tx.get("students", 0))
-        teachers = int(tx.get("teachers", 0))
-        billing_cycle = str(tx.get("billingCycle", "monthly")).lower()
-        additional_exam_packs = int(tx.get("additionalExamPacks", 0))
-
         paid_amount     = float(itn_data.get("amount_gross", 0))
         expected_amount = float(tx.get("expectedAmount", 0))
 
@@ -334,31 +322,56 @@ def payfast_itn():
             tx_ref.set({"status": "amount_mismatch", "paidAmount": paid_amount}, merge=True)
             return "", 200
 
-        # Calculate billing period end date based on cycle
+        target_type   = tx.get("targetType", "school")
+        uid           = tx.get("uid")
+        billing_cycle = str(tx.get("billingCycle", "monthly")).lower()
+
+        # Calculate billing period end date
         cycle_months_map = {"monthly": 1, "quarterly": 3, "yearly": 12, "annual": 12}
         months_to_add = cycle_months_map.get(billing_cycle, 1)
 
         now        = datetime.now(timezone.utc)
         period_end = now + timedelta(days=months_to_add * 30)
 
-        # Provision updated school subscription
         batch = db.batch()
 
-        sub_ref = db.collection("subscriptions").document(school_id)
-        batch.set(sub_ref, {
-            "schoolId": school_id,
-            "status": "active",
-            "billingCycle": billing_cycle,
-            "seats": {
-                "students": students,
-                "teachers": teachers
-            },
-            "additionalExamPacks": fs_admin.Increment(additional_exam_packs) if additional_exam_packs else additional_exam_packs,
-            "currentPeriodStart": now.isoformat(),
-            "currentPeriodEnd": period_end.isoformat(),
-            "pfPaymentId": pf_payment_id,
-            "updatedAt": fs_admin.SERVER_TIMESTAMP
-        }, merge=True)
+        # Branch Provisioning for Parent vs School
+        if target_type == "parent":
+            parent_sub_ref = db.collection("parentSubscriptions").document(uid)
+            batch.set(parent_sub_ref, {
+                "uid": uid,
+                "status": "subscribed",
+                "billingCycle": billing_cycle,
+                "currentPeriodStart": now.isoformat(),
+                "currentPeriodEnd": period_end.isoformat(),
+                "pfPaymentId": pf_payment_id,
+                "updatedAt": fs_admin.SERVER_TIMESTAMP
+            }, merge=True)
+
+            logger.info("[ITN] ✓ Parent %s provisioned with %s plan", uid, billing_cycle)
+        else:
+            school_id = tx.get("schoolId", "")
+            students = int(tx.get("students", 0))
+            teachers = int(tx.get("teachers", 0))
+            additional_exam_packs = int(tx.get("additionalExamPacks", 0))
+
+            sub_ref = db.collection("subscriptions").document(school_id)
+            batch.set(sub_ref, {
+                "schoolId": school_id,
+                "status": "active",
+                "billingCycle": billing_cycle,
+                "seats": {
+                    "students": students,
+                    "teachers": teachers
+                },
+                "additionalExamPacks": fs_admin.Increment(additional_exam_packs) if additional_exam_packs else additional_exam_packs,
+                "currentPeriodStart": now.isoformat(),
+                "currentPeriodEnd": period_end.isoformat(),
+                "pfPaymentId": pf_payment_id,
+                "updatedAt": fs_admin.SERVER_TIMESTAMP
+            }, merge=True)
+
+            logger.info("[ITN] ✓ School %s provisioned with %d students / %d teachers", school_id, students, teachers)
 
         batch.set(tx_ref, {
             "status":      "complete",
@@ -369,13 +382,11 @@ def payfast_itn():
 
         batch.commit()
 
-        _audit("seats_upgraded", "payfast_itn", school_id, {
-            "students": students,
-            "teachers": teachers,
+        _audit("subscription_activated", "payfast_itn", uid if target_type == "parent" else tx.get("schoolId"), {
+            "targetType": target_type,
             "amount": paid_amount
         })
 
-        logger.info("[ITN] ✓ School %s provisioned with %d students / %d teachers", school_id, students, teachers)
         return "", 200
 
     except Exception:
