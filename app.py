@@ -88,24 +88,77 @@ from extract_exam import extract_exam, extract_memo
 import traceback
 import threading
 import hashlib
-from groq import Groq
 from billing_routes import billing_bp
 from marking_service import create_rubric_cache, mark_student_submission
+from groq import Groq, RateLimitError as GroqRateLimitError, \
+    APIStatusError as GroqAPIStatusError, APIError as GroqAPIError
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("eduket")
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 
+
+try:
+    from pypdf import PdfReader
+except ImportError:
+    PdfReader = None
+
+logger = logging.getLogger(__name__)
+
 # ══════════════════════════════════════════════════════════════════════════════
 # GEMINI CLIENT
 # ══════════════════════════════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════════════════════════════
+# AI CLIENT — Groq primary, Gemini paid rescue
+# ══════════════════════════════════════════════════════════════════════════════
+# Same routing shape as extract_exams_v2.py and marking.py: Groq first, Gemini
+# only when Groq is unconfigured, in a post-429 cooldown, over its rolling TPM
+# budget, or actually errors. See the DUPLICATION WARNING already in
+# extract_exams_v2.py's docstring — this is now the THIRD copy of this
+# TPM/cooldown logic. Move it into a shared ai_routing.py all three import.
+#
+# THREAD SAFETY: unlike the two standalone batch scripts, this runs inside
+# gunicorn's gthread workers — multiple threads inside one worker process
+# share this module's state. _genai_lock already existed for exactly this
+# reason; _groq_lock below protects the new TPM usage log and cooldown
+# timestamp the same way.
+#
+# MULTI-WORKER CAVEAT: the lock protects against races WITHIN one gunicorn
+# worker process. It does NOT coordinate the TPM budget ACROSS worker
+# processes — each forked worker tracks its own local view of Groq usage, so
+# with N workers the real aggregate call rate to Groq can be up to N× what
+# any single worker's budget check believes it is. GROQ_TPM_BUDGET below is
+# deliberately conservative for this reason; if you run multiple workers,
+# either divide it by worker count via env (WEB_CONCURRENCY or similar), or
+# treat the pre-flight budget check as a soft heuristic only and rely on the
+# real RateLimitError catch (which IS authoritative, since it comes from
+# Groq itself observing your account's actual aggregate usage) as the real
+# safety net. Worth revisiting with a shared store (Redis) if this becomes
+# a real cost/throughput problem in production.
+#
+# CONFIRM BEFORE RUNNING: GROQ_MODEL_EXTRACT / GROQ_MODEL_MARK below default
+# to "openai/gpt-oss-120b" — verify against
+# https://console.groq.com/docs/models before relying on this in production.
+
 MODEL_EXTRACT = os.getenv("GEMINI_MODEL_EXTRACT", "gemini-3.1-flash-lite")
 MODEL_MARK    = os.getenv("GEMINI_MODEL_MARK",    "gemini-3.1-flash-lite")
 
+GROQ_MODEL_EXTRACT = os.getenv("GROQ_MODEL_EXTRACT", "openai/gpt-oss-120b")
+GROQ_MODEL_MARK    = os.getenv("GROQ_MODEL_MARK",    "openai/gpt-oss-120b")
+GROQ_TPM_BUDGET = int(os.getenv("GROQ_TPM_BUDGET", "50000"))
+GROQ_COOLDOWN_SECONDS = int(os.getenv("GROQ_COOLDOWN_SECONDS", "90"))
+GROQ_MIN_PDF_CHARS = 200   # below this, a "PDF" is treated as unreadable/scanned
+
 _genai_client: genai.Client | None = None
 _genai_lock = threading.Lock()
+
+_groq_client: Groq | None = None
+_groq_lock = threading.Lock()
+
+_groq_usage_log: list[tuple[float, int]] = []
+_groq_cooldown_until: float = 0.0
 
 
 def get_genai() -> genai.Client:
@@ -125,6 +178,79 @@ def get_genai() -> genai.Client:
     return _genai_client
 
 
+def get_groq() -> Groq | None:
+    """Lazy singleton, same fork-safety reasoning as get_genai(). Returns
+    None (not an exception) when unconfigured, so callers can treat 'no Groq
+    key' as just another routing-to-Gemini condition rather than an error."""
+    global _groq_client
+    key = os.getenv("GROQ_API_KEY")
+    if not key:
+        return None
+    if _groq_client is None:
+        with _groq_lock:
+            if _groq_client is None:
+                _groq_client = Groq(api_key=key)
+                logger.info("Groq client created (pid %s)", os.getpid())
+    return _groq_client
+
+
+def _estimate_tokens(text: str) -> int:
+    return max(1, len(text) // 4)
+
+
+def _groq_budget_ok(estimated_tokens: int) -> bool:
+    now = time.time()
+    with _groq_lock:
+        global _groq_usage_log
+        _groq_usage_log = [(t, n) for t, n in _groq_usage_log if now - t < 60]
+        used = sum(n for _, n in _groq_usage_log)
+        return (used + estimated_tokens) <= GROQ_TPM_BUDGET
+
+
+def _groq_record_usage(tokens: int) -> None:
+    with _groq_lock:
+        _groq_usage_log.append((time.time(), tokens))
+
+
+def _groq_in_cooldown() -> bool:
+    with _groq_lock:
+        return time.time() < _groq_cooldown_until
+
+
+def _groq_start_cooldown() -> None:
+    global _groq_cooldown_until
+    with _groq_lock:
+        _groq_cooldown_until = time.time() + GROQ_COOLDOWN_SECONDS
+    logger.warning("Groq cooldown started (pid %s) — routing to Gemini for %ss",
+                    os.getpid(), GROQ_COOLDOWN_SECONDS)
+
+
+def _parse_groq_json(raw: str) -> dict:
+    """Groq's json_object mode guarantees valid JSON only, not schema shape —
+    same codefence-strip defensive parse used in the other two scripts."""
+    text = raw.strip()
+    if text.startswith("```"):
+        text = re.sub(r'^```(?:json)?\s*', '', text)
+        text = re.sub(r'\s*```$', '', text)
+    return json.loads(text)
+
+
+def _pdf_to_text(file_bytes: bytes) -> str:
+    """Text-only extraction for the Groq detour on ai_document(). Dumb on
+    purpose — no layout reconstruction, no OCR. Thin results mean a
+    scanned/image paper, which only Gemini's native document reading can
+    actually handle."""
+    if not PdfReader:
+        return ""
+    try:
+        from io import BytesIO
+        reader = PdfReader(BytesIO(file_bytes))
+        return "\n".join((page.extract_text() or "") for page in reader.pages).strip()
+    except Exception as e:
+        logger.warning("pypdf extraction failed: %s: %s", type(e).__name__, e)
+        return ""
+
+
 def _log_usage(resp, label: str):
     """
     Record real token counts. Estimates drift; the meter does not. Watch these
@@ -139,9 +265,7 @@ def _log_usage(resp, label: str):
         pass
 
 
-def ai_text(prompt: str, max_tokens: int = 2000,
-            temperature: float = 0.1, model: str | None = None) -> str:
-    """Plain text completion."""
+def _gemini_text(prompt: str, max_tokens: int, temperature: float, model: str | None) -> str:
     resp = get_genai().models.generate_content(
         model=model or MODEL_EXTRACT,
         contents=prompt,
@@ -150,16 +274,61 @@ def ai_text(prompt: str, max_tokens: int = 2000,
             max_output_tokens=max_tokens,
         ),
     )
-    _log_usage(resp, "text")
+    _log_usage(resp, "text[gemini]")
     return (resp.text or "").strip()
 
 
-def ai_json(prompt: str, schema: dict, max_tokens: int = 8192,
-            temperature: float = 0.0, model: str | None = None):
+def _groq_text(prompt: str, max_tokens: int, temperature: float) -> str:
+    resp = get_groq().chat.completions.create(
+        model=GROQ_MODEL_EXTRACT,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+    usage = getattr(resp, "usage", None)
+    total_tokens = getattr(usage, "total_tokens", None) or _estimate_tokens(prompt)
+    _groq_record_usage(total_tokens)
+    if usage:
+        logger.info("[Tokens] text[groq] in=%s out=%s total=%s",
+                     usage.prompt_tokens, usage.completion_tokens, total_tokens)
+    return (resp.choices[0].message.content or "").strip()
+
+
+def ai_text(prompt: str, max_tokens: int = 2000,
+            temperature: float = 0.1, model: str | None = None) -> str:
     """
-    Structured completion. The response is schema-valid by construction, so
-    callers parse it directly — no regex, no repair, no truncation handling.
+    Plain text completion. Groq-primary, Gemini-rescue when Groq is
+    unconfigured, in cooldown, over its TPM budget, or errors.
+
+    An explicit `model=` bypasses the hybrid routing entirely and goes
+    straight to Gemini with that model — preserves the old behaviour for any
+    caller that deliberately wants a specific Gemini model rather than
+    whichever provider the router would otherwise pick.
     """
+    if model or not get_groq():
+        return _gemini_text(prompt, max_tokens, temperature, model)
+
+    if _groq_in_cooldown() or not _groq_budget_ok(_estimate_tokens(prompt)):
+        return _gemini_text(prompt, max_tokens, temperature, model)
+
+    try:
+        return _groq_text(prompt, max_tokens, temperature)
+    except GroqRateLimitError:
+        _groq_start_cooldown()
+        return _gemini_text(prompt, max_tokens, temperature, model)
+    except GroqAPIStatusError as e:
+        if e.status_code in (413, 429):
+            _groq_start_cooldown()
+        else:
+            logger.warning("Groq text call failed (status %s), falling back this call only: %s",
+                            e.status_code, e)
+        return _gemini_text(prompt, max_tokens, temperature, model)
+    except GroqAPIError as e:
+        logger.warning("Groq text call failed (%s), falling back to Gemini: %s", type(e).__name__, e)
+        return _gemini_text(prompt, max_tokens, temperature, model)
+
+
+def _gemini_json(prompt: str, schema: dict, max_tokens: int, temperature: float, model: str | None):
     resp = get_genai().models.generate_content(
         model=model or MODEL_EXTRACT,
         contents=prompt,
@@ -170,17 +339,72 @@ def ai_json(prompt: str, schema: dict, max_tokens: int = 8192,
             response_schema=schema,
         ),
     )
-    _log_usage(resp, "json")
+    _log_usage(resp, "json[gemini]")
     return json.loads(resp.text)
 
 
-def ai_document(file_bytes: bytes, mime_type: str, prompt: str,
-                schema: dict | None = None, max_tokens: int = 32768,
-                model: str | None = None):
+def _groq_json(prompt: str, schema: dict, max_tokens: int, temperature: float):
+    schema_hint = json.dumps(schema, indent=2)
+    full_prompt = (
+        f"{prompt}\n\n"
+        f"Respond with ONLY a single JSON object matching this shape "
+        f"(no markdown fences, no commentary):\n{schema_hint}"
+    )
+    resp = get_groq().chat.completions.create(
+        model=GROQ_MODEL_EXTRACT,
+        messages=[{"role": "user", "content": full_prompt}],
+        temperature=temperature,
+        max_tokens=max_tokens,
+        response_format={"type": "json_object"},
+    )
+    usage = getattr(resp, "usage", None)
+    total_tokens = getattr(usage, "total_tokens", None) or _estimate_tokens(full_prompt)
+    _groq_record_usage(total_tokens)
+    if usage:
+        logger.info("[Tokens] json[groq] in=%s out=%s total=%s",
+                     usage.prompt_tokens, usage.completion_tokens, total_tokens)
+    return _parse_groq_json(resp.choices[0].message.content)
+
+
+def ai_json(prompt: str, schema: dict, max_tokens: int = 8192,
+            temperature: float = 0.0, model: str | None = None):
     """
-    Send a document straight to the model. Gemini reads the PDF including
-    layout, tables and figures — no text extraction, no OCR fallback.
+    Structured completion. Groq-primary, Gemini-rescue on the same
+    conditions as ai_text().
+
+    Gemini's response_schema guarantees schema-conformant JSON by
+    construction; Groq's json_object mode only guarantees *valid* JSON, so
+    the Groq path embeds the schema as a description in the prompt and does
+    a defensive codefence-strip parse (_parse_groq_json) that Gemini doesn't
+    need. Callers should keep tolerating missing/extra keys either way,
+    exactly as before.
     """
+    if model or not get_groq():
+        return _gemini_json(prompt, schema, max_tokens, temperature, model)
+
+    estimated = _estimate_tokens(prompt) + _estimate_tokens(json.dumps(schema))
+    if _groq_in_cooldown() or not _groq_budget_ok(estimated):
+        return _gemini_json(prompt, schema, max_tokens, temperature, model)
+
+    try:
+        return _groq_json(prompt, schema, max_tokens, temperature)
+    except GroqRateLimitError:
+        _groq_start_cooldown()
+        return _gemini_json(prompt, schema, max_tokens, temperature, model)
+    except GroqAPIStatusError as e:
+        if e.status_code in (413, 429):
+            _groq_start_cooldown()
+        else:
+            logger.warning("Groq json call failed (status %s), falling back this call only: %s",
+                            e.status_code, e)
+        return _gemini_json(prompt, schema, max_tokens, temperature, model)
+    except (GroqAPIError, json.JSONDecodeError) as e:
+        logger.warning("Groq json call failed (%s), falling back to Gemini: %s", type(e).__name__, e)
+        return _gemini_json(prompt, schema, max_tokens, temperature, model)
+
+
+def _gemini_document(file_bytes: bytes, mime_type: str, prompt: str,
+                      schema: dict | None, max_tokens: int, model: str | None):
     config = types.GenerateContentConfig(
         temperature=0.0,
         max_output_tokens=max_tokens,
@@ -197,8 +421,79 @@ def ai_document(file_bytes: bytes, mime_type: str, prompt: str,
         ],
         config=config,
     )
-    _log_usage(resp, "document")
+    _log_usage(resp, "document[gemini]")
     return json.loads(resp.text) if schema else (resp.text or "").strip()
+
+
+def ai_document(file_bytes: bytes, mime_type: str, prompt: str,
+                schema: dict | None = None, max_tokens: int = 32768,
+                model: str | None = None):
+    """
+    Send a document to the model. This is the "heavy token extraction" case
+    you specifically wanted reserved for Gemini's native document reading
+    (layout, tables, figures) — so the Groq detour here is narrower than
+    ai_text()/ai_json():
+
+      - Only attempted for mime_type == "application/pdf". Groq's text
+        models have no vision/native-document input at all, so images and
+        anything else go straight to Gemini, unconditionally.
+      - The PDF's text is pulled via pypdf first (_pdf_to_text). If that
+        yields under GROQ_MIN_PDF_CHARS, the paper is almost certainly
+        scanned/image-based — only Gemini can actually read it — so Gemini
+        is used regardless of Groq's TPM budget or cooldown state.
+      - Only once there's real, substantial extracted text does this behave
+        like ai_json(): TPM budget check, then Groq, with the same
+        rate-limit/cooldown fallback to Gemini.
+
+    An explicit `model=` bypasses all of the above and goes straight to
+    Gemini with that model, same as ai_text()/ai_json().
+    """
+    if model or mime_type != "application/pdf" or not get_groq():
+        return _gemini_document(file_bytes, mime_type, prompt, schema, max_tokens, model)
+
+    text = _pdf_to_text(file_bytes)
+    if len(text) < GROQ_MIN_PDF_CHARS:
+        logger.info("PDF text extraction too thin (%d chars) — likely scanned, using Gemini", len(text))
+        return _gemini_document(file_bytes, mime_type, prompt, schema, max_tokens, model)
+
+    full_prompt = f"{prompt}\n\nDOCUMENT TEXT:\n{text}"
+    if schema:
+        full_prompt += (f"\n\nRespond with ONLY a single JSON object matching this shape "
+                         f"(no markdown fences, no commentary):\n{json.dumps(schema, indent=2)}")
+
+    estimated = _estimate_tokens(full_prompt)
+    if _groq_in_cooldown() or not _groq_budget_ok(estimated):
+        return _gemini_document(file_bytes, mime_type, prompt, schema, max_tokens, model)
+
+    try:
+        resp = get_groq().chat.completions.create(
+            model=GROQ_MODEL_EXTRACT,
+            messages=[{"role": "user", "content": full_prompt}],
+            temperature=0.0,
+            max_tokens=max_tokens,
+            response_format={"type": "json_object"} if schema else None,
+        )
+        usage = getattr(resp, "usage", None)
+        total_tokens = getattr(usage, "total_tokens", None) or estimated
+        _groq_record_usage(total_tokens)
+        if usage:
+            logger.info("[Tokens] document[groq] in=%s out=%s total=%s",
+                         usage.prompt_tokens, usage.completion_tokens, total_tokens)
+        content = resp.choices[0].message.content or ""
+        return _parse_groq_json(content) if schema else content.strip()
+    except GroqRateLimitError:
+        _groq_start_cooldown()
+        return _gemini_document(file_bytes, mime_type, prompt, schema, max_tokens, model)
+    except GroqAPIStatusError as e:
+        if e.status_code in (413, 429):
+            _groq_start_cooldown()
+        else:
+            logger.warning("Groq document call failed (status %s), falling back this call only: %s",
+                            e.status_code, e)
+        return _gemini_document(file_bytes, mime_type, prompt, schema, max_tokens, model)
+    except (GroqAPIError, json.JSONDecodeError) as e:
+        logger.warning("Groq document call failed (%s), falling back to Gemini: %s", type(e).__name__, e)
+        return _gemini_document(file_bytes, mime_type, prompt, schema, max_tokens, model)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

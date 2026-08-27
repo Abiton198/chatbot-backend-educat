@@ -1,76 +1,102 @@
 from __future__ import annotations
 """
-extraction_engine.py — Eduket OS  v6.0  (Gemini, shared module)
+extraction_engine.py — Eduket OS  v7.0  (Groq-primary hybrid, shared module)
 ═══════════════════════════════════════════════════════════════════════════════
 THE SINGLE HOME FOR AI EXTRACTION
 ─────────────────────────────────
-app.py and extract_exams_v2.py both import from here. Nothing below is
+app.py and extract_exams_v2.py both import from here. Nothing below should be
 duplicated in either file — that duplication is what produced two ai_text()
-implementations, one of which re-raised on 413 and silently killed the Gemini
-fallback it was supposed to reach.
+implementations before, one of which re-raised on 413 and silently killed the
+Gemini fallback it was supposed to reach.
 
-WHAT CHANGED FROM v5.1
-══════════════════════
+>>> IF app.py CURRENTLY HAS ITS OWN ai_text/ai_json/ai_document <<<
+That's the exact drift the paragraph above warns about, happening again.
+Replace app.py's local copies with `from extraction_engine import ai_text,
+ai_json, ai_document, ...` instead of maintaining a second implementation —
+otherwise the two WILL diverge (different routing logic, different Groq
+models, different bugs fixed in only one place) the same way the old
+Gemini-only ai_text() implementations did.
 
-1. GROQ IS GONE. Single provider: the paid Gemini Developer API.
-
-2. RENDER-FIRST IS NO LONGER THE READING STRATEGY. Gemini reads the PDF
-   directly — layout, tables, equations and figures — in one call. The
-   page-by-page vision loop, the two-phase page classifier, the per-page merge
-   and the instruction-phrase blocklist are all deleted. The schema and prompt
-   do that work now, and the model sees the whole paper rather than one page at
-   a time, so it can tell a cover page from a question page by context.
-
-3. PAGE IMAGES ARE STILL RENDERED AND UPLOADED. A described graph is not a
-   graph. Questions flagged has_visual get the URL of the page they appear on,
-   so a learner answering a Mathematics graph question sees the actual figure.
-   Gemini reports the page number, which is what makes this cheap.
-
-4. STRUCTURED OUTPUT. response_schema guarantees valid JSON in a known shape.
-
-5. _PARSING_HINTS PRESERVED. The subject-specific rules — Accounting tables,
-   the Mathematics "(2) vs [25]" mark distinction, LaTeX conventions, matching
-   columns — are domain knowledge worth more than the code around them. They
-   are injected into the extraction prompt.
-
-BUGS FIXED FROM v5.1
+WHAT CHANGED IN v7.0
 ════════════════════
-  - `_upload_page_image(...)` passed a literal Ellipsis and raised TypeError on
-    every low-text page
-  - `_render_pages` was defined twice; the second silently shadowed the first
-  - pages with >300 chars of native text appended [] and were skipped, while
-    `if questions:` returned early — so mixed papers lost their text pages and
-    never reached the fallback
+REVERTED TO GROQ AS THE PRIMARY PROVIDER, GEMINI AS PAID RESCUE. v6.0 removed
+Groq entirely in favour of single-provider Gemini. That's reverted here for
+cost: Groq's decommissioned Llama 3.3 70B is replaced by GPT OSS 120B / Qwen
+3.6 27B, which handles the large majority of calls at lower cost, and Gemini
+is paid for only when a call genuinely needs it.
 
-Requires:  pip install google-genai
-Env:       GEMINI_API_KEY, optionally GEMINI_MODEL_EXTRACT / GEMINI_MODEL_MARK
-"""
-"""
-extraction_engine.py — Eduket OS  v6.1  (Gemini, shared module)
-═══════════════════════════════════════════════════════════════════════════════
-THE SINGLE HOME FOR AI EXTRACTION
-─────────────────────────────────
-app.py and extract_exams_v2.py both import from here.
+Routing applies to ai_text(), ai_json() and ai_document() — i.e. everywhere
+in this file and its callers that reaches the network at all:
+  1. Groq is tried first.
+  2. Falls back to Gemini when: no GROQ_API_KEY; an active post-429 cooldown;
+     the rolling TPM budget would be exceeded; or (ai_document only) the PDF's
+     locally-extracted text is too thin to work with (reuses
+     extract_text_from_pdf_local() + looks_insufficient(), already defined
+     below for the free local-extraction path — no new dependency needed for
+     this).
+  3. A genuine Groq rate-limit/context-length error also starts a cooldown,
+     so the rest of a run's calls skip straight to Gemini for a while instead
+     of hammering Groq.
+  4. An explicit `model=` argument on any of the three functions bypasses the
+     hybrid entirely and forces that exact Gemini model — unchanged behaviour
+     for any caller that deliberately wants a specific Gemini model.
 
-WHAT CHANGED IN v6.1
-════════════════════
-1. COST & PERFORMANCE OPTIMIZATION:
-   - Updated default model from gemini-2.0-flash to gemini-2.5-flash-lite.
+TASK-AWARE MODEL SELECTION: ai_text()/ai_json() take an optional `task`
+("extract" or "mark", default "extract") so the Groq model AND the Gemini
+rescue model can differ for extraction vs marking — mirrors the existing
+MODEL_EXTRACT/MODEL_MARK split, just extended to Groq
+(GROQ_MODEL_EXTRACT/GROQ_MODEL_MARK). mark_answer() below now passes
+task="mark" instead of forcing model=MODEL_MARK, so marking actually gets a
+chance to run on Groq — forcing model= there previously would have bypassed
+Groq for every single marking call, which is the opposite of "marking can be
+done by Groq models" per the actual requirement this was built for.
+extract_exam_and_memo_single_pass() similarly no longer forces
+model=MODEL_EXTRACT on its ai_document() call, for the same reason.
+
+THREAD SAFETY / MULTI-WORKER CAVEAT: this module runs inside gunicorn's
+gthread workers, same as get_client()/_client_lock already assumed. The new
+Groq TPM usage log and cooldown timestamp are protected by _groq_lock the
+same way. That lock only protects against races WITHIN one worker process —
+it does NOT coordinate the TPM budget ACROSS worker processes, so with N
+workers the real aggregate Groq call rate can run up to N× past what any
+single worker's pre-flight budget check believes. GROQ_TPM_BUDGET is
+deliberately conservative for this reason. The actual RateLimitError catch
+IS authoritative regardless (it reflects Groq's view of your true aggregate
+account usage), so the safety net still holds even if the pre-flight check
+under-estimates. Worth a shared store (Redis) if this becomes a real
+throughput problem in production.
+
+CONFIRM BEFORE RUNNING: GROQ_MODEL_EXTRACT / GROQ_MODEL_MARK default to
+"openai/gpt-oss-120b" — Groq's likely hosted slug for the model named in
+Groq's Llama 3.3 70B decommission notice. Verify against
+https://console.groq.com/docs/models before relying on this in production;
+model slugs on Groq's catalog change, and this default may be stale by the
+time you read it. Same caution for GROQ_TPM_BUDGET — the value here is a
+conservative starting point, not a confirmed account limit.
+
+──────────────────────────────────────────────────────────────────────────
+WHAT WAS ALREADY TRUE AS OF v6.1 (unchanged by this update)
+──────────────────────────────────────────────────────────────────────────
+1. COST & PERFORMANCE:
+   - Default model gemini-2.5-flash-lite.
    - Combined Question Extraction (TASK 1) and Memo Extraction (TASK 2) into a
      single-pass multimodal call via `extract_exam_and_memo_single_pass()`.
      This halves PDF vision token expenditure per processed paper.
-   - Halved max_output_tokens default to 16,384 to reduce output token inflation.
+   - max_output_tokens defaults to 16,384.
 
-2. BUG FIXES & COMPLETIION:
-   - Completed the truncated `render_page()`, `render_pages()`, and `attach_page_images()`
-     functions that were cut off in v6.0.
+2. BUG FIXES: `render_page()`, `render_pages()`, `attach_page_images()`
+   completed after being cut off in v6.0.
 
-Requires:  pip install google-genai fitz python-magic
-Env:       GEMINI_API_KEY, optionally GEMINI_MODEL_EXTRACT / GEMINI_MODEL_MARK
+Requires:  pip install google-genai fitz python-magic groq
+Env:       GEMINI_API_KEY, GROQ_API_KEY, optionally GEMINI_MODEL_EXTRACT,
+           GEMINI_MODEL_MARK, GROQ_MODEL_EXTRACT, GROQ_MODEL_MARK,
+           GROQ_TPM_BUDGET, GROQ_COOLDOWN_SECONDS
 """
 
 import io
 import os
+import re
+import time
 import json
 import uuid
 import shutil
@@ -82,6 +108,8 @@ import magic         # MIME sniffing for upload validation
 
 from google import genai
 from google.genai import types
+from groq import Groq, RateLimitError as GroqRateLimitError, \
+    APIStatusError as GroqAPIStatusError, APIError as GroqAPIError
 import hashlib
 import logging
 import subprocess
@@ -96,15 +124,34 @@ logger = logging.getLogger(__name__)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# GEMINI CLIENT
+# AI CLIENTS — Groq primary, Gemini paid rescue
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Updated default model to gemini-2.5-flash-lite for minimal latency and cost
 MODEL_EXTRACT = os.getenv("GEMINI_MODEL_EXTRACT", "gemini-2.5-flash-lite")
 MODEL_MARK    = os.getenv("GEMINI_MODEL_MARK",    "gemini-2.5-flash-lite")
 
+GROQ_MODEL_EXTRACT = os.getenv("GROQ_MODEL_EXTRACT", "openai/gpt-oss-120b")
+GROQ_MODEL_MARK    = os.getenv("GROQ_MODEL_MARK",    "openai/gpt-oss-120b")
+GROQ_TPM_BUDGET = int(os.getenv("GROQ_TPM_BUDGET", "50000"))
+GROQ_COOLDOWN_SECONDS = int(os.getenv("GROQ_COOLDOWN_SECONDS", "90"))
+GROQ_MIN_PDF_CHARS_PER_PAGE = 50   # matches looks_insufficient()'s own default
+
 _client: genai.Client | None = None
 _client_lock = threading.Lock()
+
+_groq_client: Groq | None = None
+_groq_lock = threading.Lock()
+
+_groq_usage_log: list[tuple[float, int]] = []
+_groq_cooldown_until: float = 0.0
+
+# task -> (Gemini default model, Groq model). "extract" covers exam/memo
+# document parsing; "mark" covers mark_answer()'s per-submission grading.
+_TASK_MODELS = {
+    "extract": (MODEL_EXTRACT, GROQ_MODEL_EXTRACT),
+    "mark":    (MODEL_MARK,    GROQ_MODEL_MARK),
+}
+
 
 def get_client() -> genai.Client:
     """Lazy singleton, built per Gunicorn worker on first use (post-fork)."""
@@ -120,6 +167,64 @@ def get_client() -> genai.Client:
     return _client
 
 
+def get_groq() -> Groq | None:
+    """Lazy singleton, same fork-safety reasoning as get_client(). Returns
+    None (not an exception) when unconfigured, so callers treat 'no Groq
+    key' as just another routing-to-Gemini condition, not an error."""
+    global _groq_client
+    key = os.getenv("GROQ_API_KEY")
+    if not key:
+        return None
+    if _groq_client is None:
+        with _groq_lock:
+            if _groq_client is None:
+                _groq_client = Groq(api_key=key)
+                logger.info("Groq client created (pid %s)", os.getpid())
+    return _groq_client
+
+
+def _estimate_tokens(text: str) -> int:
+    return max(1, len(text) // 4)
+
+
+def _groq_budget_ok(estimated_tokens: int) -> bool:
+    now = time.time()
+    with _groq_lock:
+        global _groq_usage_log
+        _groq_usage_log = [(t, n) for t, n in _groq_usage_log if now - t < 60]
+        used = sum(n for _, n in _groq_usage_log)
+        return (used + estimated_tokens) <= GROQ_TPM_BUDGET
+
+
+def _groq_record_usage(tokens: int) -> None:
+    with _groq_lock:
+        _groq_usage_log.append((time.time(), tokens))
+
+
+def _groq_in_cooldown() -> bool:
+    with _groq_lock:
+        return time.time() < _groq_cooldown_until
+
+
+def _groq_start_cooldown() -> None:
+    global _groq_cooldown_until
+    with _groq_lock:
+        _groq_cooldown_until = time.time() + GROQ_COOLDOWN_SECONDS
+    logger.warning("Groq cooldown started (pid %s) — routing to Gemini for %ss",
+                    os.getpid(), GROQ_COOLDOWN_SECONDS)
+
+
+def _parse_groq_json(raw: str) -> dict:
+    """Groq's json_object mode guarantees valid JSON only, not schema shape —
+    Gemini's response_schema guarantees both, so this defensive codefence-
+    strip parse is only needed on the Groq path."""
+    text = raw.strip()
+    if text.startswith("```"):
+        text = re.sub(r'^```(?:json)?\s*', '', text)
+        text = re.sub(r'\s*```$', '', text)
+    return json.loads(text)
+
+
 def _log_usage(resp, label: str):
     """Real token counts, logged so you can aggregate daily spend from logs."""
     try:
@@ -132,26 +237,70 @@ def _log_usage(resp, label: str):
         pass
 
 
-def ai_text(prompt: str, max_tokens: int = 2000,
-            temperature: float = 0.1, model: str | None = None) -> str:
-    """Plain text completion. Cheapest call type — prefer this over ai_document."""
+def _gemini_text(prompt: str, max_tokens: int, temperature: float, model: str | None, task: str) -> str:
+    gemini_default, _ = _TASK_MODELS.get(task, _TASK_MODELS["extract"])
     resp = get_client().models.generate_content(
-        model=model or MODEL_EXTRACT,
+        model=model or gemini_default,
         contents=prompt,
         config=types.GenerateContentConfig(
             temperature=temperature,
             max_output_tokens=max_tokens,
         ),
     )
-    _log_usage(resp, "text")
+    _log_usage(resp, f"text[gemini:{task}]")
     return (resp.text or "").strip()
 
 
-def ai_json(prompt: str, schema: dict, max_tokens: int = 8192,
-            temperature: float = 0.0, model: str | None = None) -> Any:
-    """Structured completion on TEXT you already extracted locally. Cheap."""
+def ai_text(prompt: str, max_tokens: int = 2000, temperature: float = 0.1,
+            model: str | None = None, task: str = "extract") -> str:
+    """
+    Plain text completion. Groq-primary, Gemini-rescue.
+
+    `task` picks which Groq/Gemini model pair to use ("extract" or "mark") —
+    see _TASK_MODELS. An explicit `model=` bypasses hybrid routing entirely
+    and forces that exact Gemini model, same as before this change.
+    """
+    if model or not get_groq():
+        return _gemini_text(prompt, max_tokens, temperature, model, task)
+
+    if _groq_in_cooldown() or not _groq_budget_ok(_estimate_tokens(prompt)):
+        return _gemini_text(prompt, max_tokens, temperature, model, task)
+
+    _, groq_model = _TASK_MODELS.get(task, _TASK_MODELS["extract"])
+    try:
+        resp = get_groq().chat.completions.create(
+            model=groq_model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        usage = getattr(resp, "usage", None)
+        total_tokens = getattr(usage, "total_tokens", None) or _estimate_tokens(prompt)
+        _groq_record_usage(total_tokens)
+        if usage:
+            logger.info("[Tokens] text[groq:%s] in=%s out=%s total=%s",
+                        task, usage.prompt_tokens, usage.completion_tokens, total_tokens)
+        return (resp.choices[0].message.content or "").strip()
+    except GroqRateLimitError:
+        _groq_start_cooldown()
+        return _gemini_text(prompt, max_tokens, temperature, model, task)
+    except GroqAPIStatusError as e:
+        if e.status_code in (413, 429):
+            _groq_start_cooldown()
+        else:
+            logger.warning("Groq text call failed (status %s), falling back this call only: %s",
+                            e.status_code, e)
+        return _gemini_text(prompt, max_tokens, temperature, model, task)
+    except GroqAPIError as e:
+        logger.warning("Groq text call failed (%s), falling back to Gemini: %s", type(e).__name__, e)
+        return _gemini_text(prompt, max_tokens, temperature, model, task)
+
+
+def _gemini_json(prompt: str, schema: dict, max_tokens: int, temperature: float,
+                  model: str | None, task: str) -> Any:
+    gemini_default, _ = _TASK_MODELS.get(task, _TASK_MODELS["extract"])
     resp = get_client().models.generate_content(
-        model=model or MODEL_EXTRACT,
+        model=model or gemini_default,
         contents=prompt,
         config=types.GenerateContentConfig(
             temperature=temperature,
@@ -160,16 +309,67 @@ def ai_json(prompt: str, schema: dict, max_tokens: int = 8192,
             response_schema=schema,
         ),
     )
-    _log_usage(resp, "json")
+    _log_usage(resp, f"json[gemini:{task}]")
     return json.loads(resp.text)
 
 
-def ai_document(pdf_bytes: bytes, prompt: str, schema: dict | None = None,
-                max_tokens: int = 16384, model: str | None = None) -> Any:
+def ai_json(prompt: str, schema: dict, max_tokens: int = 8192, temperature: float = 0.0,
+            model: str | None = None, task: str = "extract") -> Any:
     """
-    Sends RAW PDF bytes to Gemini (document-vision). Most expensive path
-    per page. Only call this after local extraction + OCR have both failed.
+    Structured completion on TEXT you already extracted locally. Groq-primary,
+    Gemini-rescue, same routing/task rules as ai_text().
+
+    Gemini's response_schema guarantees schema-conformant JSON by
+    construction; Groq's json_object mode only guarantees *valid* JSON, so
+    the Groq path embeds the schema as a description in the prompt and does
+    a defensive parse (_parse_groq_json) that the Gemini path doesn't need.
+    Callers should keep tolerating missing/extra keys either way, as before.
     """
+    if model or not get_groq():
+        return _gemini_json(prompt, schema, max_tokens, temperature, model, task)
+
+    estimated = _estimate_tokens(prompt) + _estimate_tokens(json.dumps(schema))
+    if _groq_in_cooldown() or not _groq_budget_ok(estimated):
+        return _gemini_json(prompt, schema, max_tokens, temperature, model, task)
+
+    _, groq_model = _TASK_MODELS.get(task, _TASK_MODELS["extract"])
+    schema_hint = json.dumps(schema, indent=2)
+    full_prompt = (
+        f"{prompt}\n\nRespond with ONLY a single JSON object matching this shape "
+        f"(no markdown fences, no commentary):\n{schema_hint}"
+    )
+    try:
+        resp = get_groq().chat.completions.create(
+            model=groq_model,
+            messages=[{"role": "user", "content": full_prompt}],
+            temperature=temperature,
+            max_tokens=max_tokens,
+            response_format={"type": "json_object"},
+        )
+        usage = getattr(resp, "usage", None)
+        total_tokens = getattr(usage, "total_tokens", None) or _estimate_tokens(full_prompt)
+        _groq_record_usage(total_tokens)
+        if usage:
+            logger.info("[Tokens] json[groq:%s] in=%s out=%s total=%s",
+                        task, usage.prompt_tokens, usage.completion_tokens, total_tokens)
+        return _parse_groq_json(resp.choices[0].message.content)
+    except GroqRateLimitError:
+        _groq_start_cooldown()
+        return _gemini_json(prompt, schema, max_tokens, temperature, model, task)
+    except GroqAPIStatusError as e:
+        if e.status_code in (413, 429):
+            _groq_start_cooldown()
+        else:
+            logger.warning("Groq json call failed (status %s), falling back this call only: %s",
+                            e.status_code, e)
+        return _gemini_json(prompt, schema, max_tokens, temperature, model, task)
+    except (GroqAPIError, json.JSONDecodeError) as e:
+        logger.warning("Groq json call failed (%s), falling back to Gemini: %s", type(e).__name__, e)
+        return _gemini_json(prompt, schema, max_tokens, temperature, model, task)
+
+
+def _gemini_document(pdf_bytes: bytes, prompt: str, schema: dict | None,
+                      max_tokens: int, model: str | None) -> Any:
     config = types.GenerateContentConfig(temperature=0.0, max_output_tokens=max_tokens)
     if schema:
         config.response_mime_type = "application/json"
@@ -183,8 +383,81 @@ def ai_document(pdf_bytes: bytes, prompt: str, schema: dict | None = None,
         ],
         config=config,
     )
-    _log_usage(resp, "document")
+    _log_usage(resp, "document[gemini]")
     return json.loads(resp.text) if schema else (resp.text or "").strip()
+
+
+def ai_document(pdf_bytes: bytes, prompt: str, schema: dict | None = None,
+                max_tokens: int = 16384, model: str | None = None) -> Any:
+    """
+    Sends a PDF to the model. Extraction-only (no `task` param — this is
+    always the "extract" pair, since marking never sends raw documents in
+    this codebase).
+
+    The "heavy token extraction" case reserved for Gemini's native document
+    reading (layout, tables, figures): Groq is only attempted once
+    extract_text_from_pdf_local() + looks_insufficient() (both already
+    defined below, for the free local-extraction path) confirm there's
+    substantial extractable text — no new PDF-parsing dependency needed,
+    since PyMuPDF is already a hard requirement of this module. A thin
+    result means a scanned/image paper, which only Gemini can actually read,
+    so Gemini is used regardless of Groq's TPM budget or cooldown state.
+
+    An explicit `model=` bypasses all of the above, same as ai_text()/
+    ai_json().
+    """
+    if model or not get_groq():
+        return _gemini_document(pdf_bytes, prompt, schema, max_tokens, model)
+
+    try:
+        text, page_count = extract_text_from_pdf_local(pdf_bytes)
+    except Exception as e:
+        logger.warning("Local PDF text extraction failed for Groq detour (%s), using Gemini: %s",
+                        type(e).__name__, e)
+        return _gemini_document(pdf_bytes, prompt, schema, max_tokens, model)
+
+    if looks_insufficient(text, page_count, min_chars_per_page=GROQ_MIN_PDF_CHARS_PER_PAGE):
+        logger.info("PDF text extraction too thin for Groq (likely scanned) — Gemini required")
+        return _gemini_document(pdf_bytes, prompt, schema, max_tokens, model)
+
+    full_prompt = f"{prompt}\n\nDOCUMENT TEXT:\n{text}"
+    if schema:
+        full_prompt += (f"\n\nRespond with ONLY a single JSON object matching this shape "
+                         f"(no markdown fences, no commentary):\n{json.dumps(schema, indent=2)}")
+
+    estimated = _estimate_tokens(full_prompt)
+    if _groq_in_cooldown() or not _groq_budget_ok(estimated):
+        return _gemini_document(pdf_bytes, prompt, schema, max_tokens, model)
+
+    try:
+        resp = get_groq().chat.completions.create(
+            model=GROQ_MODEL_EXTRACT,
+            messages=[{"role": "user", "content": full_prompt}],
+            temperature=0.0,
+            max_tokens=max_tokens,
+            response_format={"type": "json_object"} if schema else None,
+        )
+        usage = getattr(resp, "usage", None)
+        total_tokens = getattr(usage, "total_tokens", None) or estimated
+        _groq_record_usage(total_tokens)
+        if usage:
+            logger.info("[Tokens] document[groq] in=%s out=%s total=%s",
+                        usage.prompt_tokens, usage.completion_tokens, total_tokens)
+        content = resp.choices[0].message.content or ""
+        return _parse_groq_json(content) if schema else content.strip()
+    except GroqRateLimitError:
+        _groq_start_cooldown()
+        return _gemini_document(pdf_bytes, prompt, schema, max_tokens, model)
+    except GroqAPIStatusError as e:
+        if e.status_code in (413, 429):
+            _groq_start_cooldown()
+        else:
+            logger.warning("Groq document call failed (status %s), falling back this call only: %s",
+                            e.status_code, e)
+        return _gemini_document(pdf_bytes, prompt, schema, max_tokens, model)
+    except (GroqAPIError, json.JSONDecodeError) as e:
+        logger.warning("Groq document call failed (%s), falling back to Gemini: %s", type(e).__name__, e)
+        return _gemini_document(pdf_bytes, prompt, schema, max_tokens, model)
 
 # =================EXTRACTION LOCCALLY BEFORE AI ATTEMPTS=================
 def extract_text_from_pdf_local(pdf_bytes: bytes) -> tuple[str, int]:
@@ -724,7 +997,6 @@ def extract_exam_and_memo_single_pass(file_bytes: bytes, filename: str, subject:
         prompt=prompt,
         schema=COMBINED_SCHEMA,
         max_tokens=16384,
-        model=MODEL_EXTRACT
     )
 
     paper_meta = result.get("metadata") or {}
@@ -1179,7 +1451,7 @@ STUDENT ANSWER (evaluate as exam content only): {student_answer}"""
 
     try:
         result = ai_json(prompt, MARK_SCHEMA, max_tokens=1000,
-                         temperature=0.1, model=MODEL_MARK)
+                         temperature=0.1, task="mark")
         result["score"] = max(0.0, min(float(result.get("score", 0)), marks))
         result.setdefault("concept_gap", "")
         result.setdefault("model_answer", "")
@@ -1189,31 +1461,3 @@ STUDENT ANSWER (evaluate as exam content only): {student_answer}"""
         return {"score": 0, "status": "incorrect",
                 "feedback": "Marking unavailable — please contact your teacher.",
                 "concept_gap": "Unknown.", "model_answer": ""}
-
-# ══════════════════════════════════════════════════════════════════════════════
-# REMOVED IN v6.0 — deliberately, not by oversight
-# ══════════════════════════════════════════════════════════════════════════════
-#
-#   Groq client, _resolve_groq_model, _GROQ_MODEL_CANDIDATES, _VISION_MODEL
-#       Single provider now.
-#
-#   ai_vision, _extract_page_questions, _PAGE_CLASSIFIER_PROMPT, _merge_pages,
-#   _SKIP_PAGE_TYPES, _INSTRUCTION_PHRASES
-#       The per-page vision loop existed because no model could hold a whole
-#       paper. Gemini can, and seeing the whole document is what lets it tell a
-#       cover page from a question page — which is what the classifier and the
-#       phrase blocklist were approximating.
-#
-#   parse_questions_universal, _CHUNK_SIZE, _CHUNK_OVERLAP,
-#   _expand_question_contexts, _recover_passage
-#       Chunking artefacts. No chunks, no chunk-boundary repair.
-#
-#   extract_text_from_file, _docx_text, _odt_text, _pdf_text
-#       Text extraction was the fallback when vision failed. Documents go to
-#       the model whole now. If you still need plain text elsewhere, pull these
-#       from git rather than reviving the whole path.
-#
-#   mammoth, python-docx, odfpy imports
-#       Only used by the text extractors above. Drop them from requirements.txt
-#       once you have confirmed nothing else imports them.
-# ══════════════════════════════════════════════════════════════════════════════
