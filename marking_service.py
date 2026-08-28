@@ -25,11 +25,11 @@ from groq import Groq, RateLimitError as GroqRateLimitError, \
 # already-confirmed extraction model rather than guessing at a second one.
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL_MARK = os.getenv("GEMINI_MODEL_MARK", "gemini-2.5-flash")
+GEMINI_MODEL_MARK = os.getenv("GEMINI_MODEL_MARK", "gemini-3.6-flash")
 GEMINI_CACHE_MODEL = os.getenv("GEMINI_CACHE_MODEL", "gemini-3.5-flash-lite")
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GROQ_MODEL_MARK = os.getenv("GROQ_MODEL_MARK", "openai/gpt-oss-120b")
+GROQ_MODEL_MARK = os.getenv("GROQ_MODEL_MARK", "groq/compound-mini")
 GROQ_TPM_BUDGET = int(os.getenv("GROQ_TPM_BUDGET", "50000"))
 GROQ_COOLDOWN_SECONDS = int(os.getenv("GROQ_COOLDOWN_SECONDS", "90"))
 
