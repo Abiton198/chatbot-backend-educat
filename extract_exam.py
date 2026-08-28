@@ -115,13 +115,13 @@ API_KEY = os.getenv("GEMINI_API_KEY")
 if not API_KEY:
     raise ValueError("GEMINI_API_KEY is not set.")
 
-MODEL_NAME = os.getenv("GEMINI_MODEL_EXTRACT", "gemini-2.5-flash")
+MODEL_NAME = os.getenv("GEMINI_MODEL_EXTRACT", "gemini-2.0-flash")
 
 # ── Groq: primary provider ───────────────────────────────────────────────
 # See the CONFIRM BEFORE RUNNING note in the module docstring — verify this
 # slug and the TPM budget against your Groq console before a large run.
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GROQ_MODEL_EXTRACT = os.getenv("GROQ_MODEL_EXTRACT", "openai/gpt-oss-120b")
+GROQ_MODEL_EXTRACT = os.getenv("GROQ_MODEL_EXTRACT", "groq/compound")
 GROQ_TPM_BUDGET = int(os.getenv("GROQ_TPM_BUDGET", "50000"))   # conservative default
 GROQ_COOLDOWN_SECONDS = int(os.getenv("GROQ_COOLDOWN_SECONDS", "90"))
 GROQ_MIN_PDF_CHARS = 200   # below this, a "PDF" is treated as unreadable/scanned
