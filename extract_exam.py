@@ -83,7 +83,6 @@ Requires:  pip install google-genai groq pypdf
 Env:       GEMINI_API_KEY, GROQ_API_KEY, optionally GEMINI_MODEL_EXTRACT,
            GROQ_MODEL_EXTRACT, GROQ_TPM_BUDGET, GROQ_COOLDOWN_SECONDS
 """
-
 import os
 import re
 import time
@@ -101,6 +100,7 @@ from google import genai
 from google.genai import types
 from groq import Groq, RateLimitError as GroqRateLimitError, \
     APIStatusError as GroqAPIStatusError, APIError as GroqAPIError
+from typing import Any
 
 try:
     from pypdf import PdfReader
@@ -115,7 +115,7 @@ API_KEY = os.getenv("GEMINI_API_KEY")
 if not API_KEY:
     raise ValueError("GEMINI_API_KEY is not set.")
 
-MODEL_NAME = os.getenv("GEMINI_MODEL_EXTRACT", "gemini-2.0-flash")
+MODEL_NAME = os.getenv("GEMINI_MODEL_EXTRACT", "gemini-3.6-flash")
 
 # ── Groq: primary provider ───────────────────────────────────────────────
 # See the CONFIRM BEFORE RUNNING note in the module docstring — verify this
@@ -133,6 +133,7 @@ os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
 _client: genai.Client | None = None
 _groq_client: Groq | None = None
+gc = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
 
 def client() -> genai.Client:
@@ -622,43 +623,29 @@ def _generate_gemini(kind: str, payload, prompt: str, schema: dict, max_tokens: 
     return json.loads(resp.text)
 
 
-def _generate_groq(text: str, prompt: str, schema: dict, max_tokens: int):
-    """
-    Text-only. Groq has no response_schema, so the shape is described in the
-    prompt instead and enforced only loosely via response_format=json_object.
-    Raises on rate-limit/context-length so the caller can fall back to Gemini.
-    """
-    gc = groq_client()
-    if gc is None:
-        raise RuntimeError("GROQ_API_KEY not set")
+def _generate_groq(text, prompt, schema=None, max_tokens=None):
+    # Ensure text/payload is converted to string content
+    if isinstance(text, bytes):
+        text_content = text.decode("utf-8", errors="ignore")
+    elif not isinstance(text, str):
+        text_content = str(text) if text is not None else ""
+    else:
+        text_content = text
 
-    schema_hint = json.dumps(schema, indent=2)
-    full_prompt = (
-        f"{prompt}\n\n"
-        f"Respond with ONLY a single JSON object matching this shape "
-        f"(no markdown fences, no commentary):\n{schema_hint}\n\n"
-        f"TEXT TO EXTRACT:\n{text}"
-    )
-    messages = [
-        {"role": "system", "content": prompt},
-        {"role": "user", "content": text}
-    ]
     groq_max_tokens = min(max_tokens, 8192) if max_tokens else 8192
+
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": str(prompt)},
+        {"role": "user", "content": text_content}
+    ]
+
     resp = gc.chat.completions.create(
-        model=GROQ_MODEL_EXTRACT,
+        model="groq/compound",
         messages=messages,
         max_tokens=groq_max_tokens,
-        temperature=0.0,
-        response_format={"type": "json_object"},
     )
 
-    usage = getattr(resp, "usage", None)
-    total_tokens = getattr(usage, "total_tokens", None) or _estimate_tokens(full_prompt)
-    _groq_record_usage(total_tokens)
-    if usage:
-        print(f"    [groq] tokens in={usage.prompt_tokens} out={usage.completion_tokens}")
-
-    return _parse_structured_json(resp.choices[0].message.content)
+    return resp.choices[0].message.content
 
 
 def _generate(kind: str, payload, prompt: str, schema: dict, max_tokens: int = 32768):
