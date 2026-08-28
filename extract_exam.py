@@ -589,22 +589,31 @@ def _parse_structured_json(raw: str) -> dict:
     return json.loads(text)
 
 
-def _generate_gemini(kind: str, payload, prompt: str, schema: dict, max_tokens: int):
+def _generate_gemini(kind: str, payload, prompt: str, schema: dict, max_tokens: int, _retry: bool = True):
     if kind == "pdf":
         contents = [types.Part.from_bytes(data=payload, mime_type="application/pdf"), prompt]
     else:
         contents = f"{prompt}\n\nTEXT TO EXTRACT:\n{payload}"
 
-    resp = client().models.generate_content(
-        model=MODEL_NAME,
-        contents=contents,
-        config=types.GenerateContentConfig(
-            temperature=0.0,
-            max_output_tokens=max_tokens,
-            response_mime_type="application/json",
-            response_schema=schema,
-        ),
-    )
+    try:
+        resp = client().models.generate_content(
+            model=MODEL_NAME,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                temperature=0.0,
+                max_output_tokens=max_tokens,
+                response_mime_type="application/json",
+                response_schema=schema,
+            ),
+        )
+    except RuntimeError as e:
+        if _retry and "client has been closed" in str(e):
+            print("    Gemini client was closed — rebuilding and retrying once")
+            global _client
+            _client = None
+            return _generate_gemini(kind, payload, prompt, schema, max_tokens, _retry=False)
+        raise
+
     try:
         u = resp.usage_metadata
         print(f"    [gemini] tokens in={u.prompt_token_count} out={u.candidates_token_count}")
