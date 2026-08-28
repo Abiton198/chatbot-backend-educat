@@ -639,12 +639,16 @@ def _generate_groq(text: str, prompt: str, schema: dict, max_tokens: int):
         f"(no markdown fences, no commentary):\n{schema_hint}\n\n"
         f"TEXT TO EXTRACT:\n{text}"
     )
-
+    messages = [
+        {"role": "system", "content": prompt},
+        {"role": "user", "content": text}
+    ]
+    groq_max_tokens = min(max_tokens, 8192) if max_tokens else 8192
     resp = gc.chat.completions.create(
         model=GROQ_MODEL_EXTRACT,
-        messages=[{"role": "user", "content": full_prompt}],
+        messages=messages,
+        max_tokens=groq_max_tokens,
         temperature=0.0,
-        max_tokens=max_tokens,
         response_format={"type": "json_object"},
     )
 
