@@ -58,7 +58,9 @@ import shutil
 import logging
 import tempfile
 import subprocess
-from datetime import datetime, timezone, timedelta, time
+from datetime import datetime, timezone, timedelta
+import time
+timestamp = time.time()
 from difflib import SequenceMatcher
 from functools import wraps
 from pathlib import Path
@@ -139,14 +141,14 @@ logger = logging.getLogger(__name__)
 # a real cost/throughput problem in production.
 #
 # CONFIRM BEFORE RUNNING: GROQ_MODEL_EXTRACT / GROQ_MODEL_MARK below default
-# to "openai/gpt-oss-120b" — verify against
+# to "groq/compound" — verify against
 # https://console.groq.com/docs/models before relying on this in production.
 
 MODEL_EXTRACT = os.getenv("GEMINI_MODEL_EXTRACT", "gemini-3.1-flash-lite")
 MODEL_MARK    = os.getenv("GEMINI_MODEL_MARK",    "gemini-3.1-flash-lite")
 
-GROQ_MODEL_EXTRACT = os.getenv("GROQ_MODEL_EXTRACT", "openai/gpt-oss-120b")
-GROQ_MODEL_MARK    = os.getenv("GROQ_MODEL_MARK",    "openai/gpt-oss-120b")
+GROQ_MODEL_EXTRACT = os.getenv("GROQ_MODEL_EXTRACT", "groq/compound")
+GROQ_MODEL_MARK    = os.getenv("GROQ_MODEL_MARK",    "groq/compound")
 GROQ_TPM_BUDGET = int(os.getenv("GROQ_TPM_BUDGET", "50000"))
 GROQ_COOLDOWN_SECONDS = int(os.getenv("GROQ_COOLDOWN_SECONDS", "90"))
 GROQ_MIN_PDF_CHARS = 200   # below this, a "PDF" is treated as unreadable/scanned
@@ -2896,7 +2898,7 @@ RULES:
         messages.append({"role": "user", "content": user_message})
 
         # 4. Generate Completion via Groq API
-        groq_model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+        groq_model = os.getenv("GROQ_MODEL", "groq/compound")
 
         completion = groq_client.chat.completions.create(
             model=groq_model,
